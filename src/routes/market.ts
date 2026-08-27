@@ -1,0 +1,1003 @@
+import { Router } from "express";
+import { z } from "zod";
+import { prisma } from "../lib/prisma.js";
+import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../services/ledger.js";
+
+export const marketRouter = Router();
+
+async function sellerStoreFor(userId: string) {
+  return prisma.sellerStore.findUnique({ where: { userId } });
+}
+
+async function ensureSellerStore(userId: string, name?: string) {
+  const existing = await sellerStoreFor(userId);
+  if (existing) return existing;
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  return prisma.sellerStore.create({
+    data: {
+      userId,
+      name: name || user?.name || "My store",
+      description: null,
+      verified: false,
+    },
+  });
+}
+
+/* ─── Catalog (public) ─────────────────────────────────────────────── */
+
+marketRouter.get("/products", async (req, res) => {
+  const q = typeof req.query.q === "string" ? req.query.q : undefined;
+  const category = typeof req.query.category === "string" ? req.query.category : undefined;
+  const storeId = typeof req.query.storeId === "string" ? req.query.storeId : undefined;
+  const products = await prisma.product.findMany({
+    where: {
+      active: true,
+      ...(q ? { title: { contains: q } } : {}),
+      ...(category ? { category: { slug: category } } : {}),
+      ...(storeId ? { storeId } : {}),
+    },
+    include: { store: true, category: true },
+    take: 50,
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(products));
+});
+
+marketRouter.get("/products/:id", async (req, res) => {
+  const product = await prisma.product.findUnique({
+    where: { id: req.params.id },
+    include: {
+      store: true,
+      category: true,
+      media: { orderBy: { sortOrder: "asc" } },
+      reviews: {
+        include: { user: { select: { id: true, name: true, avatarUrl: true } } },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+      },
+    },
+  });
+  if (!product) return fail(res, 404, "NOT_FOUND", "Product not found");
+  return ok(res, serialize(product));
+});
+
+marketRouter.get("/categories", async (_req, res) => {
+  const cats = await prisma.category.findMany({ orderBy: { name: "asc" } });
+  return ok(res, serialize(cats));
+});
+
+marketRouter.get("/stores/:id", async (req, res) => {
+  const store = await prisma.sellerStore.findUnique({
+    where: { id: req.params.id },
+    include: {
+      user: { select: { id: true, name: true, avatarUrl: true } },
+      products: { where: { active: true }, take: 40, orderBy: { createdAt: "desc" }, include: { category: true } },
+    },
+  });
+  if (!store) return fail(res, 404, "NOT_FOUND", "Store not found");
+  return ok(res, serialize(store));
+});
+
+/* ─── Seller store + products ──────────────────────────────────────── */
+
+marketRouter.get("/seller/store", requireAuth, async (req, res) => {
+  const store = await ensureSellerStore(req.user!.id);
+  return ok(res, serialize(store));
+});
+
+marketRouter.patch("/seller/store", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(2).optional(),
+      description: z.string().optional().nullable(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid store");
+  const store = await ensureSellerStore(req.user!.id, body.data.name);
+  const updated = await prisma.sellerStore.update({
+    where: { id: store.id },
+    data: {
+      ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+      ...(body.data.description !== undefined ? { description: body.data.description } : {}),
+    },
+  });
+  return ok(res, serialize(updated));
+});
+
+marketRouter.get("/seller/products", requireAuth, async (req, res) => {
+  const store = await ensureSellerStore(req.user!.id);
+  const products = await prisma.product.findMany({
+    where: { storeId: store.id },
+    include: { category: true, media: { orderBy: { sortOrder: "asc" } } },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(products));
+});
+
+marketRouter.post("/seller/products", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      title: z.string().min(2),
+      description: z.string().optional(),
+      priceMinor: z.union([z.string(), z.number()]),
+      currency: z.enum(["NGN", "CNY", "USD"]).default("USD"),
+      imageUrl: z.string().url().optional().nullable(),
+      moq: z.string().optional(),
+      categoryId: z.string().uuid().optional().nullable(),
+      mediaUrls: z.array(z.string().url()).optional(),
+      active: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
+  const store = await ensureSellerStore(req.user!.id);
+  const product = await prisma.$transaction(async (tx) => {
+    const p = await tx.product.create({
+      data: {
+        storeId: store.id,
+        title: body.data.title,
+        description: body.data.description,
+        priceMinor: BigInt(body.data.priceMinor),
+        currency: body.data.currency,
+        imageUrl: body.data.imageUrl ?? body.data.mediaUrls?.[0] ?? null,
+        moq: body.data.moq ?? "1 unit",
+        categoryId: body.data.categoryId ?? null,
+        active: body.data.active ?? true,
+      },
+    });
+    const urls = body.data.mediaUrls ?? (body.data.imageUrl ? [body.data.imageUrl] : []);
+    for (let i = 0; i < urls.length; i++) {
+      await tx.productMedia.create({
+        data: { productId: p.id, url: urls[i], sortOrder: i },
+      });
+    }
+    return tx.product.findUnique({
+      where: { id: p.id },
+      include: { media: true, category: true, store: true },
+    });
+  });
+  return ok(res, serialize(product), 201);
+});
+
+marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NO_STORE", "No seller store");
+  const existing = await prisma.product.findFirst({ where: { id: req.params.id, storeId: store.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
+  const body = z
+    .object({
+      title: z.string().min(2).optional(),
+      description: z.string().optional().nullable(),
+      priceMinor: z.union([z.string(), z.number()]).optional(),
+      imageUrl: z.string().url().optional().nullable(),
+      moq: z.string().optional(),
+      categoryId: z.string().uuid().optional().nullable(),
+      active: z.boolean().optional(),
+      mediaUrls: z.array(z.string().url()).optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
+  const product = await prisma.$transaction(async (tx) => {
+    const p = await tx.product.update({
+      where: { id: existing.id },
+      data: {
+        ...(body.data.title !== undefined ? { title: body.data.title } : {}),
+        ...(body.data.description !== undefined ? { description: body.data.description } : {}),
+        ...(body.data.priceMinor !== undefined ? { priceMinor: BigInt(body.data.priceMinor) } : {}),
+        ...(body.data.imageUrl !== undefined ? { imageUrl: body.data.imageUrl } : {}),
+        ...(body.data.moq !== undefined ? { moq: body.data.moq } : {}),
+        ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
+        ...(body.data.active !== undefined ? { active: body.data.active } : {}),
+      },
+    });
+    if (body.data.mediaUrls) {
+      await tx.productMedia.deleteMany({ where: { productId: p.id } });
+      for (let i = 0; i < body.data.mediaUrls.length; i++) {
+        await tx.productMedia.create({
+          data: { productId: p.id, url: body.data.mediaUrls[i], sortOrder: i },
+        });
+      }
+      if (body.data.mediaUrls[0] && body.data.imageUrl === undefined) {
+        await tx.product.update({ where: { id: p.id }, data: { imageUrl: body.data.mediaUrls[0] } });
+      }
+    }
+    return tx.product.findUnique({
+      where: { id: p.id },
+      include: { media: true, category: true },
+    });
+  });
+  return ok(res, serialize(product));
+});
+
+marketRouter.delete("/seller/products/:id", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NO_STORE", "No seller store");
+  const existing = await prisma.product.findFirst({ where: { id: req.params.id, storeId: store.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
+  await prisma.product.update({ where: { id: existing.id }, data: { active: false } });
+  return ok(res, { id: existing.id, active: false });
+});
+
+/* ─── Seller orders ────────────────────────────────────────────────── */
+
+marketRouter.get("/seller/orders", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return ok(res, []);
+  const orders = await prisma.marketOrder.findMany({
+    where: { OR: [{ supplier: store.id }, { supplier: store.name }] },
+    include: {
+      items: true,
+      user: { select: { id: true, name: true, phone: true, avatarUrl: true } },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(orders));
+});
+
+marketRouter.get("/seller/orders/:id", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    include: {
+      items: { include: { product: true } },
+      user: { select: { id: true, name: true, phone: true, avatarUrl: true, email: true } },
+    },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  return ok(res, serialize(order));
+});
+
+marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const body = z
+    .object({
+      status: z.enum(["IN_ESCROW", "SHIPPED", "DELIVERED", "DISPUTED", "CANCELLED"]).optional(),
+      tracking: z.string().optional(),
+      carrier: z.string().optional(),
+      note: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid update");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (body.data.status === "SHIPPED" && !["IN_ESCROW", "SHIPPED"].includes(order.status)) {
+    return fail(res, 400, "BAD_STATUS", `Cannot mark shipped from ${order.status}`);
+  }
+  if (body.data.status === "DELIVERED" && !["SHIPPED", "DELIVERED"].includes(order.status)) {
+    return fail(res, 400, "BAD_STATUS", "Mark shipped before marking delivered");
+  }
+  const updated = await prisma.marketOrder.update({
+    where: { id: order.id },
+    data: {
+      ...(body.data.status ? { status: body.data.status } : {}),
+    },
+    include: { items: true, user: { select: { id: true, name: true, phone: true } } },
+  });
+  if (order.escrowId && (body.data.status === "SHIPPED" || body.data.status === "DELIVERED")) {
+    await prisma.escrowMilestone.updateMany({
+      where: { escrowId: order.escrowId, status: "FUNDED", releaseRequestedAt: null },
+      data: { releaseRequestedAt: new Date() },
+    });
+  }
+  const title =
+    body.data.status === "SHIPPED"
+      ? "Seller marked order as shipped"
+      : body.data.status === "DELIVERED"
+        ? "Seller marked order as delivered"
+        : "Order update";
+  await prisma.notification.create({
+    data: {
+      userId: order.userId,
+      title,
+      body: [
+        body.data.status ? `Status: ${body.data.status}` : null,
+        body.data.carrier ? `Carrier: ${body.data.carrier}` : null,
+        body.data.tracking ? `Tracking: ${body.data.tracking}` : null,
+        body.data.note,
+      ]
+        .filter(Boolean)
+        .join(" · ") || title,
+    },
+  });
+  return ok(res, serialize(updated));
+});
+
+async function sellerMeta(userId: string) {
+  const bp = await prisma.businessProfile.findUnique({ where: { userId } });
+  return (bp?.documents as Record<string, unknown> | null) ?? {};
+}
+
+async function saveSellerMeta(userId: string, patch: Record<string, unknown>) {
+  const existing = await sellerMeta(userId);
+  const merged = { ...existing, ...patch };
+  await prisma.businessProfile.upsert({
+    where: { userId },
+    create: { userId, companyName: "Seller", documents: merged, status: "DRAFT" },
+    update: { documents: merged },
+  });
+  return merged;
+}
+
+marketRouter.get("/seller/templates", requireAuth, async (req, res) => {
+  await ensureSellerStore(req.user!.id);
+  const meta = await sellerMeta(req.user!.id);
+  const templates = (meta.templates as unknown[]) ?? [];
+  return ok(res, templates);
+});
+
+marketRouter.put("/seller/templates", requireAuth, async (req, res) => {
+  const body = z.object({ templates: z.array(z.object({ id: z.string(), title: z.string(), body: z.string() })) }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid templates");
+  await saveSellerMeta(req.user!.id, { templates: body.data.templates });
+  return ok(res, body.data.templates);
+});
+
+marketRouter.get("/seller/orders/:id/documents", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const meta = await sellerMeta(req.user!.id);
+  const all = (meta.orderDocs as Record<string, unknown[]>) ?? {};
+  return ok(res, all[order.id] ?? []);
+});
+
+marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const body = z.object({ kind: z.string(), name: z.string(), url: z.string().min(4) }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const meta = await sellerMeta(req.user!.id);
+  const all = { ...((meta.orderDocs as Record<string, unknown[]>) ?? {}) };
+  const list = [...(all[order.id] ?? []), { ...body.data, uploadedAt: new Date().toISOString() }];
+  all[order.id] = list;
+  await saveSellerMeta(req.user!.id, { orderDocs: all });
+  await prisma.notification.create({
+    data: { userId: order.userId, title: "New shipping document", body: `${body.data.name} · order ${order.id.slice(0, 8)}` },
+  });
+  return ok(res, list[list.length - 1], 201);
+});
+
+/* ─── Cart ─────────────────────────────────────────────────────────── */
+
+marketRouter.get("/cart", requireAuth, async (req, res) => {
+  let cart = await prisma.cart.findUnique({
+    where: { userId: req.user!.id },
+    include: { items: { include: { product: true } } },
+  });
+  if (!cart) {
+    cart = await prisma.cart.create({
+      data: { userId: req.user!.id },
+      include: { items: { include: { product: true } } },
+    });
+  }
+  return ok(res, serialize(cart));
+});
+
+marketRouter.post("/cart/items", requireAuth, async (req, res) => {
+  const body = z
+    .object({ productId: z.string().uuid(), qty: z.number().int().positive().default(1) })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid cart item");
+  let cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
+  if (!cart) cart = await prisma.cart.create({ data: { userId: req.user!.id } });
+  const item = await prisma.cartItem.upsert({
+    where: { cartId_productId: { cartId: cart.id, productId: body.data.productId } },
+    create: { cartId: cart.id, productId: body.data.productId, qty: body.data.qty },
+    update: { qty: { increment: body.data.qty } },
+    include: { product: true },
+  });
+  return ok(res, serialize(item), 201);
+});
+
+marketRouter.patch("/cart/items/:id", requireAuth, async (req, res) => {
+  const body = z.object({ qty: z.number().int().positive() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid qty");
+  const cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
+  if (!cart) return fail(res, 404, "NOT_FOUND", "Cart not found");
+  const existing = await prisma.cartItem.findFirst({ where: { id: req.params.id, cartId: cart.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Item not found");
+  const item = await prisma.cartItem.update({
+    where: { id: existing.id },
+    data: { qty: body.data.qty },
+    include: { product: true },
+  });
+  return ok(res, serialize(item));
+});
+
+marketRouter.delete("/cart/items/:id", requireAuth, async (req, res) => {
+  const cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
+  if (!cart) return fail(res, 404, "NOT_FOUND", "Cart not found");
+  const existing = await prisma.cartItem.findFirst({ where: { id: req.params.id, cartId: cart.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Item not found");
+  await prisma.cartItem.delete({ where: { id: existing.id } });
+  return ok(res, { id: existing.id, deleted: true });
+});
+
+marketRouter.post("/checkout", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      addressLabel: z.string().optional(),
+      addressLine: z.string().optional(),
+    })
+    .safeParse(req.body ?? {});
+  const cart = await prisma.cart.findUnique({
+    where: { userId: req.user!.id },
+    include: { items: { include: { product: { include: { store: true } } } } },
+  });
+  if (!cart?.items.length) return fail(res, 400, "EMPTY_CART", "Cart is empty");
+
+  const storeIds = [...new Set(cart.items.map((i) => i.product.storeId))];
+  if (storeIds.length > 1) {
+    return fail(res, 400, "MIXED_CART", "Remove items from other suppliers before checkout");
+  }
+
+  const currency = cart.items[0].product.currency;
+  const goodsMinor = cart.items.reduce(
+    (s, i) => s + i.product.priceMinor * BigInt(i.qty),
+    0n,
+  );
+  const feeMinor = BigInt(Math.floor(Number(goodsMinor) * 0.009));
+  const totalMinor = goodsMinor + feeMinor;
+  const supplier = storeIds[0]!;
+  const sellerUserId = cart.items[0].product.store.userId;
+  const orderTitle =
+    cart.items.length === 1
+      ? cart.items[0].product.title
+      : `${cart.items.length} items · ${cart.items[0].product.title}`;
+
+  try {
+    const order = await prisma.$transaction(async (tx) => {
+      await lockToHold(
+        tx,
+        req.user!.id,
+        currency,
+        totalMinor,
+        "ESCROW_HOLD",
+        "Market checkout escrow",
+      );
+      const escrow = await tx.escrow.create({
+        data: {
+          title: orderTitle,
+          buyerId: req.user!.id,
+          sellerId: sellerUserId,
+          amountMinor: totalMinor,
+          currency,
+          status: "ACTIVE",
+          progress: 1,
+        },
+      });
+      await tx.escrowMilestone.create({
+        data: {
+          escrowId: escrow.id,
+          label: "Order total · held in escrow",
+          amountMinor: totalMinor,
+          sortOrder: 0,
+          status: "FUNDED",
+        },
+      });
+      const o = await tx.marketOrder.create({
+        data: {
+          userId: req.user!.id,
+          status: "IN_ESCROW",
+          totalMinor,
+          currency,
+          supplier,
+          escrowId: escrow.id,
+          items: {
+            create: cart.items.map((i) => ({
+              productId: i.productId,
+              title: i.product.title,
+              qty: i.qty,
+              priceMinor: i.product.priceMinor,
+            })),
+          },
+        },
+        include: { items: true },
+      });
+      for (const item of cart.items) {
+        if (item.product.stock != null) {
+          if (item.product.stock < item.qty) {
+            throw new Error(`Insufficient stock for ${item.product.title}`);
+          }
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { stock: item.product.stock - item.qty },
+          });
+        }
+      }
+      await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
+      await recordTx(tx, {
+        userId: req.user!.id,
+        kind: "order",
+        title: `Order ${o.id.slice(0, 8)}`,
+        currency,
+        amountDisplay: `−${formatMoney(currency, totalMinor)}`,
+        amountPositive: false,
+        status: "COMPLETED",
+        icon: "package",
+      });
+      await recordTx(tx, {
+        userId: req.user!.id,
+        kind: "escrow",
+        title: orderTitle,
+        currency,
+        amountDisplay: formatMoney(currency, totalMinor),
+        amountPositive: false,
+        status: "COMPLETED",
+        icon: "shield",
+      });
+      await tx.notification.create({
+        data: {
+          userId: sellerUserId,
+          title: "New market order",
+          body: `${orderTitle} · ${formatMoney(currency, totalMinor)}`,
+        },
+      });
+      if (body.success && (body.data.addressLabel || body.data.addressLine)) {
+        await tx.notification.create({
+          data: {
+            userId: req.user!.id,
+            title: "Shipping address saved",
+            body: [body.data.addressLabel, body.data.addressLine].filter(Boolean).join(" · "),
+          },
+        });
+      }
+      return { ...o, escrowId: escrow.id };
+    });
+    return ok(res, serialize(order), 201);
+  } catch (e) {
+    return fail(res, 400, "CHECKOUT_FAILED", e instanceof Error ? e.message : "Checkout failed");
+  }
+});
+
+/* ─── Buyer orders ─────────────────────────────────────────────────── */
+
+marketRouter.get("/orders", requireAuth, async (req, res) => {
+  const orders = await prisma.marketOrder.findMany({
+    where: { userId: req.user!.id },
+    include: { items: true },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(orders));
+});
+
+marketRouter.get("/orders/:id", requireAuth, async (req, res) => {
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+    include: { items: { include: { product: true } } },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  return ok(res, serialize(order));
+});
+
+marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
+  const orderId = String(req.params.id);
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: orderId, userId: req.user!.id },
+    include: { items: true },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (!order.items.length) return fail(res, 400, "EMPTY_ORDER", "Order has no line items");
+
+  const cart = await prisma.cart.upsert({
+    where: { userId: req.user!.id },
+    create: { userId: req.user!.id },
+    update: {},
+  });
+
+  await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
+  for (const line of order.items) {
+    const product = await prisma.product.findFirst({
+      where: { id: line.productId, active: true },
+    });
+    if (!product) continue;
+    await prisma.cartItem.create({
+      data: {
+        cartId: cart.id,
+        productId: line.productId,
+        qty: line.qty,
+      },
+    });
+  }
+
+  const rebuilt = await prisma.cart.findUnique({
+    where: { id: cart.id },
+    include: { items: { include: { product: { include: { store: true } } } } },
+  });
+  if (!rebuilt?.items.length) {
+    return fail(res, 400, "UNAVAILABLE", "None of the original products are available");
+  }
+  return ok(res, serialize(rebuilt));
+});
+
+marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (order.status === "COMPLETED") return ok(res, serialize(order));
+  if (!["SHIPPED", "DELIVERED"].includes(order.status)) {
+    return fail(
+      res,
+      400,
+      "NOT_READY",
+      "Seller must mark this order as shipped (or delivered) before you can release funds",
+    );
+  }
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      if (order.escrowId) {
+        const escrow = await tx.escrow.findUnique({
+          where: { id: order.escrowId },
+          include: { milestones: true },
+        });
+        const ms = escrow?.milestones.find((m) => m.status === "FUNDED");
+        if (escrow?.sellerId && ms) {
+          await settleEscrowRelease(
+            tx,
+            order.userId,
+            escrow.sellerId,
+            escrow.currency,
+            ms.amountMinor,
+            `Release ${ms.label}`,
+            ms.id,
+          );
+          await tx.escrowMilestone.update({ where: { id: ms.id }, data: { status: "RELEASED" } });
+          const remaining = await tx.escrowMilestone.count({
+            where: { escrowId: escrow.id, status: { not: "RELEASED" } },
+          });
+          await tx.escrow.update({
+            where: { id: escrow.id },
+            data: { status: remaining === 0 ? "COMPLETED" : "ACTIVE", progress: remaining === 0 ? 1 : 0.75 },
+          });
+        }
+      }
+      return tx.marketOrder.update({
+        where: { id: order.id },
+        data: { status: "COMPLETED" },
+        include: { items: true },
+      });
+    });
+    const store = await prisma.sellerStore.findUnique({ where: { id: order.supplier } });
+    if (store) {
+      await prisma.notification.create({
+        data: {
+          userId: store.userId,
+          title: "Funds released",
+          body: `Buyer released order ${order.id.slice(0, 8)}`,
+        },
+      });
+    }
+    return ok(res, serialize(updated));
+  } catch (e) {
+    return fail(res, 400, "RELEASE_FAILED", e instanceof Error ? e.message : "Release failed");
+  }
+});
+
+marketRouter.post("/orders/:id/dispute", requireAuth, async (req, res) => {
+  const body = z
+    .object({ reason: z.string().min(5), category: z.string().optional() })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid dispute");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const updated = await prisma.marketOrder.update({
+    where: { id: order.id },
+    data: { status: "DISPUTED" },
+    include: { items: true },
+  });
+  const store = await prisma.sellerStore.findUnique({ where: { id: order.supplier } });
+  if (store) {
+    await prisma.notification.create({
+      data: {
+        userId: store.userId,
+        title: "Order disputed",
+        body: body.data.reason.slice(0, 120),
+      },
+    });
+  }
+  return ok(res, serialize(updated));
+});
+
+marketRouter.post("/orders/:id/reviews", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      productId: z.string().uuid().optional(),
+      rating: z.number().int().min(1).max(5),
+      comment: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid review");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+    include: { items: true },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const productId = body.data.productId || order.items[0]?.productId;
+  if (!productId) return fail(res, 400, "NO_PRODUCT", "No product on order");
+  const review = await prisma.review.create({
+    data: {
+      userId: req.user!.id,
+      productId,
+      rating: body.data.rating,
+      comment: body.data.comment,
+    },
+    include: { user: { select: { id: true, name: true, avatarUrl: true } } },
+  });
+  const agg = await prisma.review.aggregate({
+    where: { productId },
+    _avg: { rating: true },
+  });
+  if (agg._avg.rating != null) {
+    await prisma.product.update({
+      where: { id: productId },
+      data: { rating: Math.round(agg._avg.rating * 10) / 10 },
+    });
+  }
+  if (order.status === "SHIPPED" || order.status === "IN_ESCROW") {
+    await prisma.marketOrder.update({ where: { id: order.id }, data: { status: "COMPLETED" } });
+  }
+  return ok(res, serialize(review), 201);
+});
+
+/* ─── Wishlist ─────────────────────────────────────────────────────── */
+
+marketRouter.get("/wishlist", requireAuth, async (req, res) => {
+  const rows = await prisma.wishlistItem.findMany({
+    where: { userId: req.user!.id },
+    include: { product: { include: { store: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(rows));
+});
+
+marketRouter.post("/wishlist", requireAuth, async (req, res) => {
+  const body = z.object({ productId: z.string().uuid() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
+  const row = await prisma.wishlistItem.upsert({
+    where: { userId_productId: { userId: req.user!.id, productId: body.data.productId } },
+    create: { userId: req.user!.id, productId: body.data.productId },
+    update: {},
+    include: { product: true },
+  });
+  return ok(res, serialize(row), 201);
+});
+
+marketRouter.delete("/wishlist/:productId", requireAuth, async (req, res) => {
+  await prisma.wishlistItem.deleteMany({
+    where: { userId: req.user!.id, productId: req.params.productId },
+  });
+  return ok(res, { deleted: true });
+});
+
+/* ─── Favorite suppliers ───────────────────────────────────────────── */
+
+marketRouter.get("/favorite-sellers", requireAuth, async (req, res) => {
+  const rows = await prisma.favoriteSupplier.findMany({
+    where: { userId: req.user!.id },
+    include: { store: { include: { user: { select: { id: true, name: true, avatarUrl: true } } } } },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(rows));
+});
+
+marketRouter.post("/favorite-sellers", requireAuth, async (req, res) => {
+  const body = z.object({ sellerStoreId: z.string().uuid() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "sellerStoreId required");
+  const store = await prisma.sellerStore.findUnique({ where: { id: body.data.sellerStoreId } });
+  if (!store) return fail(res, 404, "NOT_FOUND", "Store not found");
+  const row = await prisma.favoriteSupplier.upsert({
+    where: {
+      userId_sellerStoreId: { userId: req.user!.id, sellerStoreId: body.data.sellerStoreId },
+    },
+    create: { userId: req.user!.id, sellerStoreId: body.data.sellerStoreId },
+    update: {},
+    include: { store: true },
+  });
+  return ok(res, serialize(row), 201);
+});
+
+marketRouter.delete("/favorite-sellers/:sellerStoreId", requireAuth, async (req, res) => {
+  await prisma.favoriteSupplier.deleteMany({
+    where: { userId: req.user!.id, sellerStoreId: String(req.params.sellerStoreId) },
+  });
+  return ok(res, { deleted: true });
+});
+
+/* ─── Seller team (stub — no SellerStoreMember model) ──────────────── */
+
+marketRouter.get("/seller/team", requireAuth, async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { id: true, name: true, phone: true, email: true, avatarUrl: true },
+  });
+  if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+  return ok(res, [{ role: "OWNER", user: serialize(user) }]);
+});
+
+marketRouter.post("/seller/team", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      phone: z.string().min(8).optional(),
+      email: z.string().email().optional(),
+      role: z.enum(["OPS", "FINANCE", "VIEWER"]).default("OPS"),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "phone or email required");
+  if (!body.data.phone && !body.data.email) {
+    return fail(res, 400, "VALIDATION", "phone or email required");
+  }
+  const store = await ensureSellerStore(req.user!.id);
+  const log = await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "seller.team.invite",
+      entity: "SellerStore",
+      entityId: store.id,
+      meta: {
+        phone: body.data.phone ?? null,
+        email: body.data.email ?? null,
+        role: body.data.role,
+        status: "pending_admin",
+      },
+    },
+  });
+  return ok(
+    res,
+    {
+      invited: true,
+      role: body.data.role,
+      phone: body.data.phone ?? null,
+      email: body.data.email ?? null,
+      auditLogId: log.id,
+      message: "Invite logged — team seats are managed by MagnetPay support",
+    },
+    201,
+  );
+});
+
+/* ─── RFQ ──────────────────────────────────────────────────────────── */
+
+marketRouter.post("/rfq", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      title: z.string().min(2),
+      description: z.string().optional(),
+      qty: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid RFQ");
+  const rfq = await prisma.rfq.create({
+    data: { buyerId: req.user!.id, ...body.data },
+  });
+  const sellers = await prisma.user.findMany({
+    where: { role: { in: ["SELLER", "BOTH"] } },
+    take: 20,
+    select: { id: true },
+  });
+  if (sellers.length) {
+    await prisma.notification.createMany({
+      data: sellers.map((s) => ({
+        userId: s.id,
+        title: "New RFQ",
+        body: rfq.title,
+      })),
+    });
+  }
+  return ok(res, serialize(rfq), 201);
+});
+
+marketRouter.get("/rfq", requireAuth, async (req, res) => {
+  const rows = await prisma.rfq.findMany({
+    where: { buyerId: req.user!.id },
+    include: {
+      quotes: {
+        include: { seller: { select: { id: true, name: true, avatarUrl: true } } },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(rows));
+});
+
+marketRouter.get("/seller/rfq", requireAuth, async (req, res) => {
+  const rows = await prisma.rfq.findMany({
+    where: { status: "open" },
+    include: {
+      buyer: { select: { id: true, name: true, phone: true, avatarUrl: true } },
+      quotes: { where: { sellerId: req.user!.id } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
+  return ok(res, serialize(rows));
+});
+
+marketRouter.get("/rfq/:id", requireAuth, async (req, res) => {
+  const rfq = await prisma.rfq.findUnique({
+    where: { id: req.params.id },
+    include: {
+      buyer: { select: { id: true, name: true, phone: true } },
+      quotes: {
+        include: { seller: { select: { id: true, name: true, avatarUrl: true } } },
+      },
+    },
+  });
+  if (!rfq) return fail(res, 404, "NOT_FOUND", "RFQ not found");
+  const isBuyer = rfq.buyerId === req.user!.id;
+  const isSeller = ["SELLER", "BOTH"].includes(
+    (await prisma.user.findUnique({ where: { id: req.user!.id }, select: { role: true } }))?.role ?? "",
+  );
+  if (!isBuyer && !isSeller) return fail(res, 403, "FORBIDDEN", "Not allowed");
+  return ok(res, serialize(rfq));
+});
+
+marketRouter.post("/rfq/:id/quotes", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      amountMinor: z.union([z.string(), z.number()]),
+      currency: z.enum(["NGN", "CNY", "USD"]).default("USD"),
+      note: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid quote");
+  const rfq = await prisma.rfq.findUnique({ where: { id: req.params.id } });
+  if (!rfq) return fail(res, 404, "NOT_FOUND", "RFQ not found");
+  const quote = await prisma.rfqQuote.create({
+    data: {
+      rfqId: rfq.id,
+      sellerId: req.user!.id,
+      amountMinor: BigInt(body.data.amountMinor),
+      currency: body.data.currency,
+      note: body.data.note,
+    },
+    include: { seller: { select: { id: true, name: true, avatarUrl: true } } },
+  });
+  await prisma.notification.create({
+    data: {
+      userId: rfq.buyerId,
+      title: "New quote on your RFQ",
+      body: rfq.title,
+    },
+  });
+  return ok(res, serialize(quote), 201);
+});
+
+marketRouter.get("/quotes/:id", requireAuth, async (req, res) => {
+  const quote = await prisma.rfqQuote.findUnique({
+    where: { id: req.params.id },
+    include: {
+      seller: { select: { id: true, name: true, avatarUrl: true, phone: true } },
+      rfq: { include: { buyer: { select: { id: true, name: true } } } },
+    },
+  });
+  if (!quote) return fail(res, 404, "NOT_FOUND", "Quote not found");
+  if (quote.rfq.buyerId !== req.user!.id && quote.sellerId !== req.user!.id) {
+    return fail(res, 403, "FORBIDDEN", "Not allowed");
+  }
+  return ok(res, serialize(quote));
+});
+
+marketRouter.get("/seller/quotes", requireAuth, async (req, res) => {
+  const quotes = await prisma.rfqQuote.findMany({
+    where: { sellerId: req.user!.id },
+    include: {
+      rfq: { include: { buyer: { select: { id: true, name: true, phone: true } } } },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(quotes));
+});
