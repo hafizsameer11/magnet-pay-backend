@@ -4,6 +4,7 @@ import { fail, ok, requireAuth, requireAdmin, serialize } from "../lib/http.js";
 import { z } from "zod";
 import { deliverUserNotification } from "../services/deliver.js";
 import { formatMoney } from "../services/ledger.js";
+import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 
 export const notificationsRouter = Router();
 export const messagesRouter = Router();
@@ -30,6 +31,28 @@ notificationsRouter.post("/:id/read", requireAuth, async (req, res) => {
   return ok(res, serialize(updated));
 });
 
+async function peerMetaForUser(peerUserId: string, conversationId: string) {
+  const [store, lastPeerMsg] = await Promise.all([
+    prisma.sellerStore.findUnique({
+      where: { userId: peerUserId },
+      include: { products: { select: { rating: true }, take: 50 } },
+    }),
+    prisma.message.findFirst({
+      where: { conversationId, senderId: peerUserId },
+      orderBy: { createdAt: "desc" },
+      select: { createdAt: true },
+    }),
+  ]);
+  const ratings = store?.products.map((p) => p.rating) ?? [];
+  const rating =
+    ratings.length > 0 ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 10) / 10 : null;
+  return {
+    storeVerified: store?.verified ?? false,
+    rating,
+    lastActiveAt: lastPeerMsg?.createdAt?.toISOString() ?? null,
+  };
+}
+
 messagesRouter.get("/conversations", requireAuth, async (req, res) => {
   const showArchived = req.query.archived === "1";
   const parts = await prisma.conversationParticipant.findMany({
@@ -48,19 +71,22 @@ messagesRouter.get("/conversations", requireAuth, async (req, res) => {
     },
     orderBy: [{ pinnedAt: "desc" }, { conversation: { updatedAt: "desc" } }],
   });
-  return ok(
-    res,
-    serialize(
-      parts.map((p) => ({
+  const rows = await Promise.all(
+    parts.map(async (p) => {
+      const peer = p.conversation.participants.find((x) => x.user.id !== req.user!.id)?.user;
+      const peerMeta = peer ? await peerMetaForUser(peer.id, p.conversation.id) : null;
+      return {
         ...p.conversation,
         myPrefs: {
           pinned: Boolean(p.pinnedAt),
           muted: p.muted,
           archived: Boolean(p.archivedAt),
         },
-      })),
-    ),
+        peerMeta,
+      };
+    }),
   );
+  return ok(res, serialize(rows));
 });
 
 messagesRouter.patch("/conversations/:id", requireAuth, async (req, res) => {
@@ -115,15 +141,74 @@ messagesRouter.post("/block", requireAuth, async (req, res) => {
   return ok(res, { blocked: true });
 });
 
+messagesRouter.get("/conversations/:id", requireAuth, async (req, res) => {
+  const ctx = await getConversationContext(String(req.params.id), req.user!.id);
+  if (!ctx) return fail(res, 404, "NOT_FOUND", "Conversation not found");
+  return ok(res, serialize(ctx));
+});
+
+messagesRouter.patch("/conversations/:id", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      productId: z.string().uuid().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid update");
+  const part = await prisma.conversationParticipant.findFirst({
+    where: { conversationId: req.params.id, userId: req.user!.id },
+  });
+  if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
+  const updated = await prisma.conversation.update({
+    where: { id: String(req.params.id) },
+    data: {
+      ...(body.data.productId !== undefined ? { productId: body.data.productId } : {}),
+    },
+  });
+  return ok(res, serialize(updated));
+});
+
+messagesRouter.post("/conversations/:id/quote", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      amountMinor: z.union([z.string(), z.number()]),
+      currency: z.enum(["NGN", "CNY", "USD"]).default("CNY"),
+      note: z.string().max(500).optional(),
+      qty: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid quote");
+  const amountMinor = BigInt(body.data.amountMinor);
+  if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
+  try {
+    const result = await upsertChatQuote({
+      conversationId: String(req.params.id),
+      sellerId: req.user!.id,
+      amountMinor,
+      currency: body.data.currency,
+      note: body.data.note,
+      qty: body.data.qty,
+    });
+    return ok(res, serialize(result), 201);
+  } catch (e) {
+    return fail(res, 400, "QUOTE_FAILED", e instanceof Error ? e.message : "Quote failed");
+  }
+});
+
 messagesRouter.post("/conversations", requireAuth, async (req, res) => {
   const body = z
-    .object({ peerUserId: z.string().uuid(), subject: z.string().optional(), body: z.string().optional() })
+    .object({
+      peerUserId: z.string().uuid(),
+      subject: z.string().optional(),
+      body: z.string().optional(),
+      productId: z.string().uuid().optional(),
+    })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "peerUserId required");
   const conv = await prisma.$transaction(async (tx) => {
     const c = await tx.conversation.create({
       data: {
         subject: body.data.subject,
+        productId: body.data.productId,
         participants: {
           create: [{ userId: req.user!.id }, { userId: body.data.peerUserId }],
         },
@@ -150,6 +235,14 @@ messagesRouter.get("/conversations/:id/messages", requireAuth, async (req, res) 
   const messages = await prisma.message.findMany({
     where: { conversationId: req.params.id },
     orderBy: { createdAt: "asc" },
+    include: {
+      quote: {
+        include: {
+          seller: { select: { id: true, name: true } },
+          rfq: { select: { id: true, title: true, qty: true } },
+        },
+      },
+    },
   });
   return ok(res, serialize(messages));
 });

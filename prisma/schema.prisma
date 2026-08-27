@@ -569,10 +569,13 @@ model RfqQuote {
   currency    Currency @default(USD)
   note        String?
   createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
   rfq         Rfq      @relation(fields: [rfqId], references: [id], onDelete: Cascade)
   seller      User     @relation("RfqQuoteSeller", fields: [sellerId], references: [id], onDelete: Cascade)
+  messages    Message[]
 
   @@index([rfqId])
+  @@index([sellerId])
 }
 
 model WishlistItem {
@@ -784,12 +787,14 @@ model ShipmentDocument {
 }
 
 model Conversation {
-  id           String                     @id @default(uuid())
-  subject      String?
-  createdAt    DateTime                   @default(now())
-  updatedAt    DateTime                   @updatedAt
-  participants ConversationParticipant[]
-  messages     Message[]
+  id            String                     @id @default(uuid())
+  subject       String?
+  productId     String?
+  latestQuoteId String?
+  createdAt     DateTime                   @default(now())
+  updatedAt     DateTime                   @updatedAt
+  participants  ConversationParticipant[]
+  messages      Message[]
 }
 
 model ConversationParticipant {
@@ -812,11 +817,14 @@ model Message {
   senderId       String
   body           String       @db.Text
   attachmentUrl  String?
+  quoteId        String?
   createdAt      DateTime     @default(now())
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  quote          RfqQuote?    @relation(fields: [quoteId], references: [id], onDelete: SetNull)
 
   @@index([conversationId])
+  @@index([quoteId])
 }
 
 model Notification {

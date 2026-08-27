@@ -85,6 +85,7 @@ authRouter.post("/otp/verify", async (req, res) => {
       phone: z.string(),
       code: z.string().length(6),
       email: z.string().email().optional(),
+      role: z.enum(["BUYER", "SELLER", "BOTH"]).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit code required");
@@ -114,7 +115,7 @@ authRouter.post("/otp/verify", async (req, res) => {
       return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
     }
     user = await prisma.user.create({
-      data: { phone, email: verifiedEmail, role: "BUYER" },
+      data: { phone, email: verifiedEmail, role: body.data.role ?? "BUYER" },
     });
     for (const currency of ["NGN", "CNY", "USD"] as const) {
       await prisma.wallet.create({ data: { userId: user.id, currency, balanceMinor: 0n } });
@@ -138,6 +139,7 @@ authRouter.post("/otp/verify", async (req, res) => {
     userId: user.id,
     phone: user.phone,
     email: user.email,
+    role: user.role,
     needsPasscode: !user.passcodeHash,
   });
 });

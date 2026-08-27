@@ -11,8 +11,14 @@ import {
 } from "../services/ledger.js";
 import { getNombaProvider } from "../services/nomba.js";
 import { deliverUserNotification } from "../services/deliver.js";
+import { assertWithinDailyLimit, getWalletLimits } from "../services/limits.js";
 
 export const walletsRouter = Router();
+
+walletsRouter.get("/limits", requireAuth, async (req, res) => {
+  const limits = await getWalletLimits(req.user!.id);
+  return ok(res, serialize(limits));
+});
 
 walletsRouter.get("/", requireAuth, async (req, res) => {
   const wallets = await prisma.wallet.findMany({ where: { userId: req.user!.id } });
@@ -92,6 +98,7 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
 
   try {
+    await assertWithinDailyLimit(req.user!.id, "deposit", body.data.currency, amountMinor);
     const user = await prisma.user.findUnique({ where: { id: req.user!.id } });
     const result = await prisma.$transaction(async (tx) => {
       const deposit = await tx.deposit.create({
@@ -156,6 +163,7 @@ walletsRouter.post("/withdraw", requireAuth, async (req, res) => {
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
 
   try {
+    await assertWithinDailyLimit(req.user!.id, "withdraw", body.data.currency, amountMinor);
     const result = await prisma.$transaction(async (tx) => {
       await debitWallet(
         tx,

@@ -6,6 +6,7 @@ import { creditWallet, debitWallet, formatMoney, recordTx } from "../services/le
 import { getNombaProvider } from "../services/nomba.js";
 import { assertRecipientVerified, verifyRecipientById } from "../services/recipient-verify.js";
 import { deliverUserNotification } from "../services/deliver.js";
+import { assertWithinDailyLimit } from "../services/limits.js";
 
 export const recipientsRouter = Router();
 export const transfersRouter = Router();
@@ -117,6 +118,7 @@ transfersRouter.post("/", requireAuth, async (req, res) => {
   const totalDebitMinor = amountMinor + fxFeeMinor + networkFeeMinor;
 
   try {
+    await assertWithinDailyLimit(req.user!.id, "send", body.data.currency, amountMinor);
     const transfer = await prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.findUnique({
         where: { userId_currency: { userId: req.user!.id, currency: body.data.currency } },
