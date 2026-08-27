@@ -27,6 +27,7 @@ npm run dev
 ```
 
 - API: `http://127.0.0.1:4000`
+- **Production:** [https://magnetpay.amctraders.online](https://magnetpay.amctraders.online) — health: [`/health`](https://magnetpay.amctraders.online/health)
 - Health: `GET /health`
 - Adminer (local Docker): `http://127.0.0.1:8080`
 

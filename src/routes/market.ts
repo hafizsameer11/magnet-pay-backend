@@ -91,6 +91,8 @@ marketRouter.patch("/seller/store", requireAuth, async (req, res) => {
     .object({
       name: z.string().min(2).optional(),
       description: z.string().optional().nullable(),
+      bannerUrl: z.string().url().optional().nullable(),
+      logoUrl: z.string().url().optional().nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid store");
@@ -100,6 +102,8 @@ marketRouter.patch("/seller/store", requireAuth, async (req, res) => {
     data: {
       ...(body.data.name !== undefined ? { name: body.data.name } : {}),
       ...(body.data.description !== undefined ? { description: body.data.description } : {}),
+      ...(body.data.bannerUrl !== undefined ? { bannerUrl: body.data.bannerUrl } : {}),
+      ...(body.data.logoUrl !== undefined ? { logoUrl: body.data.logoUrl } : {}),
     },
   });
   return ok(res, serialize(updated));
@@ -127,6 +131,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
       categoryId: z.string().uuid().optional().nullable(),
       mediaUrls: z.array(z.string().url()).optional(),
       active: z.boolean().optional(),
+      stock: z.number().int().nonnegative().optional().nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -143,6 +148,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         moq: body.data.moq ?? "1 unit",
         categoryId: body.data.categoryId ?? null,
         active: body.data.active ?? true,
+        ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
       },
     });
     const urls = body.data.mediaUrls ?? (body.data.imageUrl ? [body.data.imageUrl] : []);
@@ -174,6 +180,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
       categoryId: z.string().uuid().optional().nullable(),
       active: z.boolean().optional(),
       mediaUrls: z.array(z.string().url()).optional(),
+      stock: z.number().int().nonnegative().optional().nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -188,6 +195,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
         ...(body.data.moq !== undefined ? { moq: body.data.moq } : {}),
         ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
         ...(body.data.active !== undefined ? { active: body.data.active } : {}),
+        ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
       },
     });
     if (body.data.mediaUrls) {
@@ -274,6 +282,13 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
     where: { id: order.id },
     data: {
       ...(body.data.status ? { status: body.data.status } : {}),
+      ...(body.data.tracking !== undefined ? { tracking: body.data.tracking || null } : {}),
+      ...(body.data.carrier !== undefined ? { carrier: body.data.carrier || null } : {}),
+      ...(body.data.note !== undefined && body.data.note
+        ? {
+            sellerNote: order.sellerNote ? `${order.sellerNote}\n${body.data.note}` : body.data.note,
+          }
+        : {}),
     },
     include: { items: true, user: { select: { id: true, name: true, phone: true } } },
   });
@@ -817,7 +832,49 @@ marketRouter.delete("/favorite-sellers/:sellerStoreId", requireAuth, async (req,
   return ok(res, { deleted: true });
 });
 
-/* ─── Seller team (stub — no SellerStoreMember model) ──────────────── */
+marketRouter.get("/seller/settings", requireAuth, async (req, res) => {
+  const meta = await sellerMeta(req.user!.id);
+  const bp = await prisma.businessProfile.findUnique({ where: { userId: req.user!.id } });
+  return ok(res, {
+    invoiceFooter: (meta.invoiceFooter as string) ?? "",
+    vatInclusive: Boolean(meta.vatInclusive),
+    autoFapiao: meta.autoFapiao !== false,
+    uscc: (meta.uscc as string) ?? bp?.licenseNo ?? "",
+    vatRate: (meta.vatRate as string) ?? "13",
+  });
+});
+
+marketRouter.patch("/seller/settings", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      invoiceFooter: z.string().optional(),
+      vatInclusive: z.boolean().optional(),
+      autoFapiao: z.boolean().optional(),
+      uscc: z.string().optional(),
+      vatRate: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid settings");
+  await saveSellerMeta(req.user!.id, body.data);
+  if (body.data.uscc !== undefined) {
+    await prisma.businessProfile.upsert({
+      where: { userId: req.user!.id },
+      create: { userId: req.user!.id, companyName: "", licenseNo: body.data.uscc },
+      update: { licenseNo: body.data.uscc },
+    });
+  }
+  const meta = await sellerMeta(req.user!.id);
+  const bp = await prisma.businessProfile.findUnique({ where: { userId: req.user!.id } });
+  return ok(res, {
+    invoiceFooter: (meta.invoiceFooter as string) ?? "",
+    vatInclusive: Boolean(meta.vatInclusive),
+    autoFapiao: meta.autoFapiao !== false,
+    uscc: (meta.uscc as string) ?? bp?.licenseNo ?? "",
+    vatRate: (meta.vatRate as string) ?? "13",
+  });
+});
+
+/* ─── Seller team ──────────────────────────────────────────────────── */
 
 marketRouter.get("/seller/team", requireAuth, async (req, res) => {
   const user = await prisma.user.findUnique({
@@ -825,7 +882,12 @@ marketRouter.get("/seller/team", requireAuth, async (req, res) => {
     select: { id: true, name: true, phone: true, email: true, avatarUrl: true },
   });
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
-  return ok(res, [{ role: "OWNER", user: serialize(user) }]);
+  const meta = await sellerMeta(req.user!.id);
+  const pending = (meta.teamInvites as { phone?: string; email?: string; role: string; invitedAt: string }[]) ?? [];
+  return ok(res, {
+    members: [{ role: "OWNER", user: serialize(user) }],
+    pendingInvites: pending,
+  });
 });
 
 marketRouter.post("/seller/team", requireAuth, async (req, res) => {
@@ -841,32 +903,27 @@ marketRouter.post("/seller/team", requireAuth, async (req, res) => {
     return fail(res, 400, "VALIDATION", "phone or email required");
   }
   const store = await ensureSellerStore(req.user!.id);
-  const log = await prisma.auditLog.create({
+  const meta = await sellerMeta(req.user!.id);
+  const pending = [...((meta.teamInvites as unknown[]) ?? [])];
+  const invite = {
+    phone: body.data.phone ?? null,
+    email: body.data.email ?? null,
+    role: body.data.role,
+    invitedAt: new Date().toISOString(),
+    status: "pending",
+  };
+  pending.push(invite);
+  await saveSellerMeta(req.user!.id, { teamInvites: pending });
+  await prisma.auditLog.create({
     data: {
       actorId: req.user!.id,
       action: "seller.team.invite",
       entity: "SellerStore",
       entityId: store.id,
-      meta: {
-        phone: body.data.phone ?? null,
-        email: body.data.email ?? null,
-        role: body.data.role,
-        status: "pending_admin",
-      },
+      meta: invite,
     },
   });
-  return ok(
-    res,
-    {
-      invited: true,
-      role: body.data.role,
-      phone: body.data.phone ?? null,
-      email: body.data.email ?? null,
-      auditLogId: log.id,
-      message: "Invite logged — team seats are managed by MagnetPay support",
-    },
-    201,
-  );
+  return ok(res, { invited: true, ...invite }, 201);
 });
 
 /* ─── RFQ ──────────────────────────────────────────────────────────── */
