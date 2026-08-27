@@ -31,8 +31,13 @@ notificationsRouter.post("/:id/read", requireAuth, async (req, res) => {
 });
 
 messagesRouter.get("/conversations", requireAuth, async (req, res) => {
+  const showArchived = req.query.archived === "1";
   const parts = await prisma.conversationParticipant.findMany({
-    where: { userId: req.user!.id },
+    where: {
+      userId: req.user!.id,
+      hiddenAt: null,
+      ...(showArchived ? {} : { archivedAt: null }),
+    },
     include: {
       conversation: {
         include: {
@@ -41,8 +46,73 @@ messagesRouter.get("/conversations", requireAuth, async (req, res) => {
         },
       },
     },
+    orderBy: [{ pinnedAt: "desc" }, { conversation: { updatedAt: "desc" } }],
   });
-  return ok(res, serialize(parts.map((p) => p.conversation)));
+  return ok(
+    res,
+    serialize(
+      parts.map((p) => ({
+        ...p.conversation,
+        myPrefs: {
+          pinned: Boolean(p.pinnedAt),
+          muted: p.muted,
+          archived: Boolean(p.archivedAt),
+        },
+      })),
+    ),
+  );
+});
+
+messagesRouter.patch("/conversations/:id", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      pinned: z.boolean().optional(),
+      muted: z.boolean().optional(),
+      archived: z.boolean().optional(),
+      hidden: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid prefs");
+  const part = await prisma.conversationParticipant.findFirst({
+    where: { conversationId: req.params.id, userId: req.user!.id },
+  });
+  if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
+  const updated = await prisma.conversationParticipant.update({
+    where: { id: part.id },
+    data: {
+      ...(body.data.pinned !== undefined ? { pinnedAt: body.data.pinned ? new Date() : null } : {}),
+      ...(body.data.muted !== undefined ? { muted: body.data.muted } : {}),
+      ...(body.data.archived !== undefined ? { archivedAt: body.data.archived ? new Date() : null } : {}),
+      ...(body.data.hidden !== undefined ? { hiddenAt: body.data.hidden ? new Date() : null } : {}),
+    },
+  });
+  return ok(res, serialize(updated));
+});
+
+messagesRouter.post("/block", requireAuth, async (req, res) => {
+  const body = z.object({ peerUserId: z.string().uuid() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "peerUserId required");
+  if (body.data.peerUserId === req.user!.id) return fail(res, 400, "VALIDATION", "Cannot block yourself");
+  await prisma.userBlock.upsert({
+    where: { userId_blockedUserId: { userId: req.user!.id, blockedUserId: body.data.peerUserId } },
+    create: { userId: req.user!.id, blockedUserId: body.data.peerUserId },
+    update: {},
+  });
+  const shared = await prisma.conversationParticipant.findMany({
+    where: { userId: req.user!.id },
+    select: { conversationId: true },
+  });
+  const peerParts = await prisma.conversationParticipant.findMany({
+    where: { userId: body.data.peerUserId, conversationId: { in: shared.map((s) => s.conversationId) } },
+    select: { conversationId: true },
+  });
+  for (const p of peerParts) {
+    await prisma.conversationParticipant.updateMany({
+      where: { conversationId: p.conversationId, userId: req.user!.id },
+      data: { hiddenAt: new Date() },
+    });
+  }
+  return ok(res, { blocked: true });
 });
 
 messagesRouter.post("/conversations", requireAuth, async (req, res) => {

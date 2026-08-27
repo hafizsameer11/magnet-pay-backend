@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../lib/prisma.js";
 import { fail, ok, requireAuth, serialize } from "../lib/http.js";
 import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../services/ledger.js";
@@ -7,7 +8,13 @@ import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../servi
 export const marketRouter = Router();
 
 async function sellerStoreFor(userId: string) {
-  return prisma.sellerStore.findUnique({ where: { userId } });
+  const owned = await prisma.sellerStore.findUnique({ where: { userId } });
+  if (owned) return owned;
+  const membership = await prisma.sellerStoreMember.findFirst({
+    where: { userId },
+    include: { store: true },
+  });
+  return membership?.store ?? null;
 }
 
 async function ensureSellerStore(userId: string, name?: string) {
@@ -132,6 +139,10 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
       mediaUrls: z.array(z.string().url()).optional(),
       active: z.boolean().optional(),
       stock: z.number().int().nonnegative().optional().nullable(),
+      variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+      pricingTiers: z
+        .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
+        .optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -149,6 +160,8 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         categoryId: body.data.categoryId ?? null,
         active: body.data.active ?? true,
         ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
+        ...(body.data.variantAxes !== undefined ? { variantAxes: body.data.variantAxes } : {}),
+        ...(body.data.pricingTiers !== undefined ? { pricingTiers: body.data.pricingTiers } : {}),
       },
     });
     const urls = body.data.mediaUrls ?? (body.data.imageUrl ? [body.data.imageUrl] : []);
@@ -181,6 +194,10 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
       active: z.boolean().optional(),
       mediaUrls: z.array(z.string().url()).optional(),
       stock: z.number().int().nonnegative().optional().nullable(),
+      variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+      pricingTiers: z
+        .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
+        .optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -196,6 +213,8 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
         ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
         ...(body.data.active !== undefined ? { active: body.data.active } : {}),
         ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
+        ...(body.data.variantAxes !== undefined ? { variantAxes: body.data.variantAxes } : {}),
+        ...(body.data.pricingTiers !== undefined ? { pricingTiers: body.data.pricingTiers } : {}),
       },
     });
     if (body.data.mediaUrls) {
@@ -335,6 +354,26 @@ async function saveSellerMeta(userId: string, patch: Record<string, unknown>) {
     update: { documents: merged },
   });
   return merged;
+}
+
+async function maybeIssueFapiao(sellerUserId: string, order: { id: string; userId: string; totalMinor: bigint; currency: string }) {
+  const meta = await sellerMeta(sellerUserId);
+  if (meta.autoFapiao === false) return null;
+  const existing = await prisma.fapiao.findFirst({ where: { orderId: order.id } });
+  if (existing) return existing;
+  const bp = await prisma.businessProfile.findUnique({ where: { userId: sellerUserId } });
+  return prisma.fapiao.create({
+    data: {
+      sellerUserId,
+      buyerUserId: order.userId,
+      orderId: order.id,
+      amountMinor: order.totalMinor,
+      currency: order.currency as "NGN" | "CNY" | "USD",
+      vatRate: (meta.vatRate as string) ?? "13",
+      uscc: (meta.uscc as string) ?? bp?.licenseNo ?? null,
+      status: "issued",
+    },
+  });
 }
 
 marketRouter.get("/seller/templates", requireAuth, async (req, res) => {
@@ -684,7 +723,10 @@ marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
         include: { items: true },
       });
     });
-    const store = await prisma.sellerStore.findUnique({ where: { id: order.supplier } });
+    const store = await prisma.sellerStore.findFirst({
+      where: { OR: [{ id: order.supplier }, { name: order.supplier }] },
+      select: { userId: true },
+    });
     if (store) {
       await prisma.notification.create({
         data: {
@@ -693,6 +735,7 @@ marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
           body: `Buyer released order ${order.id.slice(0, 8)}`,
         },
       });
+      await maybeIssueFapiao(store.userId, order).catch(() => null);
     }
     return ok(res, serialize(updated));
   } catch (e) {
@@ -877,16 +920,27 @@ marketRouter.patch("/seller/settings", requireAuth, async (req, res) => {
 /* ─── Seller team ──────────────────────────────────────────────────── */
 
 marketRouter.get("/seller/team", requireAuth, async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: req.user!.id },
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NO_STORE", "No seller store");
+  const owner = await prisma.user.findUnique({
+    where: { id: store.userId },
     select: { id: true, name: true, phone: true, email: true, avatarUrl: true },
   });
-  if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
-  const meta = await sellerMeta(req.user!.id);
-  const pending = (meta.teamInvites as { phone?: string; email?: string; role: string; invitedAt: string }[]) ?? [];
+  const members = await prisma.sellerStoreMember.findMany({
+    where: { storeId: store.id },
+    include: { user: { select: { id: true, name: true, phone: true, email: true, avatarUrl: true } } },
+    orderBy: { joinedAt: "asc" },
+  });
+  const pendingInvites = await prisma.sellerTeamInvite.findMany({
+    where: { storeId: store.id, status: "pending" },
+    orderBy: { createdAt: "desc" },
+  });
   return ok(res, {
-    members: [{ role: "OWNER", user: serialize(user) }],
-    pendingInvites: pending,
+    members: [
+      ...(owner ? [{ role: "OWNER", user: serialize(owner) }] : []),
+      ...members.map((m) => ({ role: m.role, user: serialize(m.user) })),
+    ],
+    pendingInvites: serialize(pendingInvites),
   });
 });
 
@@ -903,27 +957,128 @@ marketRouter.post("/seller/team", requireAuth, async (req, res) => {
     return fail(res, 400, "VALIDATION", "phone or email required");
   }
   const store = await ensureSellerStore(req.user!.id);
-  const meta = await sellerMeta(req.user!.id);
-  const pending = [...((meta.teamInvites as unknown[]) ?? [])];
-  const invite = {
-    phone: body.data.phone ?? null,
-    email: body.data.email ?? null,
-    role: body.data.role,
-    invitedAt: new Date().toISOString(),
-    status: "pending",
-  };
-  pending.push(invite);
-  await saveSellerMeta(req.user!.id, { teamInvites: pending });
-  await prisma.auditLog.create({
+  if (store.userId !== req.user!.id) return fail(res, 403, "FORBIDDEN", "Only store owner can invite");
+  const token = uuidv4();
+  const invite = await prisma.sellerTeamInvite.create({
     data: {
-      actorId: req.user!.id,
-      action: "seller.team.invite",
-      entity: "SellerStore",
-      entityId: store.id,
-      meta: invite,
+      storeId: store.id,
+      token,
+      phone: body.data.phone ?? null,
+      email: body.data.email ?? null,
+      role: body.data.role,
+      invitedById: req.user!.id,
+      expiresAt: new Date(Date.now() + 14 * 86400000),
     },
   });
-  return ok(res, { invited: true, ...invite }, 201);
+  if (body.data.phone) {
+    const invitee = await prisma.user.findFirst({ where: { phone: body.data.phone } });
+    if (invitee) {
+      await prisma.notification.create({
+        data: {
+          userId: invitee.id,
+          title: "Seller team invite",
+          body: `You were invited to ${store.name} as ${body.data.role}`,
+          href: `/seller/team/accept?token=${token}`,
+        },
+      });
+    }
+  }
+  return ok(res, serialize(invite), 201);
+});
+
+marketRouter.get("/team/invites", requireAuth, async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { phone: true, email: true },
+  });
+  if (!user) return ok(res, []);
+  const invites = await prisma.sellerTeamInvite.findMany({
+    where: {
+      status: "pending",
+      expiresAt: { gt: new Date() },
+      OR: [
+        ...(user.phone ? [{ phone: user.phone }] : []),
+        ...(user.email ? [{ email: user.email }] : []),
+      ],
+    },
+    include: { store: { select: { id: true, name: true } } },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(invites));
+});
+
+marketRouter.post("/team/invites/:token/accept", requireAuth, async (req, res) => {
+  const token = String(req.params.token);
+  const invite = await prisma.sellerTeamInvite.findUnique({ where: { token } });
+  if (!invite || invite.status !== "pending") return fail(res, 404, "NOT_FOUND", "Invite not found");
+  if (invite.expiresAt < new Date()) return fail(res, 410, "EXPIRED", "Invite expired");
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { phone: true, email: true },
+  });
+  const match =
+    (invite.phone && user?.phone === invite.phone) || (invite.email && user?.email === invite.email);
+  if (!match) return fail(res, 403, "FORBIDDEN", "Invite not for this account");
+  await prisma.$transaction(async (tx) => {
+    await tx.sellerStoreMember.upsert({
+      where: { storeId_userId: { storeId: invite.storeId, userId: req.user!.id } },
+      create: { storeId: invite.storeId, userId: req.user!.id, role: invite.role },
+      update: { role: invite.role },
+    });
+    await tx.sellerTeamInvite.update({ where: { id: invite.id }, data: { status: "accepted" } });
+  });
+  return ok(res, { accepted: true, storeId: invite.storeId, role: invite.role });
+});
+
+/* ─── Fapiao ───────────────────────────────────────────────────────── */
+
+marketRouter.get("/seller/fapiao", requireAuth, async (req, res) => {
+  const rows = await prisma.fapiao.findMany({
+    where: { sellerUserId: req.user!.id },
+    include: { buyer: { select: { id: true, name: true, phone: true } } },
+    orderBy: { issuedAt: "desc" },
+    take: 50,
+  });
+  return ok(res, serialize(rows));
+});
+
+marketRouter.post("/seller/fapiao", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      orderId: z.string().uuid().optional(),
+      amountMinor: z.union([z.string(), z.number()]).optional(),
+      currency: z.enum(["NGN", "CNY", "USD"]).optional(),
+      buyerUserId: z.string().uuid().optional(),
+      documentUrl: z.string().url().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid fapiao");
+  const meta = await sellerMeta(req.user!.id);
+  const bp = await prisma.businessProfile.findUnique({ where: { userId: req.user!.id } });
+  let order: { id: string; userId: string; totalMinor: bigint; currency: string } | null = null;
+  if (body.data.orderId) {
+    const store = await sellerStoreFor(req.user!.id);
+    if (!store) return fail(res, 404, "NO_STORE", "No seller store");
+    const o = await prisma.marketOrder.findFirst({
+      where: { id: body.data.orderId, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    });
+    if (!o) return fail(res, 404, "NOT_FOUND", "Order not found");
+    order = o;
+  }
+  const row = await prisma.fapiao.create({
+    data: {
+      sellerUserId: req.user!.id,
+      buyerUserId: body.data.buyerUserId ?? order?.userId ?? null,
+      orderId: body.data.orderId ?? null,
+      amountMinor: BigInt(body.data.amountMinor ?? order?.totalMinor ?? 0),
+      currency: (body.data.currency ?? order?.currency ?? "CNY") as "NGN" | "CNY" | "USD",
+      vatRate: (meta.vatRate as string) ?? "13",
+      uscc: (meta.uscc as string) ?? bp?.licenseNo ?? null,
+      documentUrl: body.data.documentUrl ?? null,
+      status: "issued",
+    },
+  });
+  return ok(res, serialize(row), 201);
 });
 
 /* ─── RFQ ──────────────────────────────────────────────────────────── */

@@ -158,6 +158,11 @@ model User {
   addresses       Address[]
   bankAccounts    BankAccount[]
   sellerStore     SellerStore?
+  sellerMemberships SellerStoreMember[]
+  fapiaoIssued    Fapiao[]        @relation("FapiaoSeller")
+  fapiaoReceived  Fapiao[]        @relation("FapiaoBuyer")
+  blocksGiven     UserBlock[]     @relation("Blocker")
+  blocksReceived  UserBlock[]     @relation("Blocked")
   cart            Cart?
   orders          MarketOrder[]
   rfqs            Rfq[]           @relation("RfqBuyer")
@@ -449,6 +454,8 @@ model SellerStore {
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   products    Product[]
   favorites   FavoriteSupplier[]
+  members     SellerStoreMember[]
+  teamInvites SellerTeamInvite[]
 }
 
 model Product {
@@ -463,6 +470,8 @@ model Product {
   moq         String         @default("1 unit")
   rating      Float          @default(4.5)
   stock       Int?
+  variantAxes Json?
+  pricingTiers Json?
   active      Boolean        @default(true)
   createdAt   DateTime       @default(now())
   store       SellerStore    @relation(fields: [storeId], references: [id], onDelete: Cascade)
@@ -787,6 +796,10 @@ model ConversationParticipant {
   id             String       @id @default(uuid())
   conversationId String
   userId         String
+  pinnedAt       DateTime?
+  muted          Boolean      @default(false)
+  archivedAt     DateTime?
+  hiddenAt       DateTime?
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -854,4 +867,66 @@ model ProviderEvent {
   user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([provider, createdAt])
+}
+
+model SellerStoreMember {
+  id       String      @id @default(uuid())
+  storeId  String
+  userId   String
+  role     String
+  joinedAt DateTime    @default(now())
+  store    SellerStore @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, userId])
+  @@index([userId])
+}
+
+model SellerTeamInvite {
+  id          String      @id @default(uuid())
+  storeId     String
+  token       String      @unique
+  phone       String?
+  email       String?
+  role        String
+  status      String      @default("pending")
+  invitedById String
+  createdAt   DateTime    @default(now())
+  expiresAt   DateTime
+  store       SellerStore @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([phone])
+  @@index([email])
+  @@index([storeId, status])
+}
+
+model Fapiao {
+  id           String   @id @default(uuid())
+  sellerUserId String
+  buyerUserId  String?
+  orderId      String?
+  amountMinor  BigInt
+  currency     Currency @default(CNY)
+  vatRate      String   @default("13")
+  uscc         String?
+  documentUrl  String?
+  status       String   @default("issued")
+  issuedAt     DateTime @default(now())
+  seller       User     @relation("FapiaoSeller", fields: [sellerUserId], references: [id], onDelete: Cascade)
+  buyer        User?    @relation("FapiaoBuyer", fields: [buyerUserId], references: [id], onDelete: SetNull)
+
+  @@index([sellerUserId])
+  @@index([orderId])
+}
+
+model UserBlock {
+  id            String   @id @default(uuid())
+  userId        String
+  blockedUserId String
+  createdAt     DateTime @default(now())
+  user          User     @relation("Blocker", fields: [userId], references: [id], onDelete: Cascade)
+  blocked       User     @relation("Blocked", fields: [blockedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, blockedUserId])
+  @@index([userId])
 }
