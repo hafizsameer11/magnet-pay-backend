@@ -3,15 +3,15 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { fail, ok, requireAuth, serialize } from "../lib/http.js";
 import {
-  consumeHold,
   formatMoney,
   lockToHold,
   recordTx,
-  unlockHoldCashback,
   debitWallet,
 } from "../services/ledger.js";
 import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-codes.js";
 import { notifyUserEmail } from "../services/notify.js";
+import { estimateQuoteMinor } from "../services/freight-pricing.js";
+import { advanceShipmentOps, settleShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
 
 export const logisticsRouter = Router();
 
@@ -32,11 +32,8 @@ logisticsRouter.get("/hs-codes/:code", requireAuth, async (req, res) => {
   return ok(res, serialize({ ...row, dutyPct: dutyPctForDestination(row, destination) }));
 });
 
-function estimateMinor(cbm: number, weightKg: number, mode: string): bigint {
-  const base = mode === "AIR" ? 450000 : mode === "EXPRESS" ? 600000 : mode === "SEA" ? 180000 : 220000;
-  const vol = Math.ceil(cbm * 100000);
-  const w = Math.ceil(weightKg * 2500);
-  return BigInt(base + vol + w);
+function estimateMinor(cbm: number, weightKg: number, mode: string): Promise<bigint> {
+  return estimateQuoteMinor(cbm, weightKg, mode);
 }
 
 logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
@@ -48,14 +45,33 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
       origin: z.string().min(2),
       destination: z.string().min(2),
       mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).default("SEA"),
+      orderId: z.string().uuid().optional(),
+      destinationDelivery: z.enum(["PICKUP", "DOORSTEP"]).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid quote request");
 
-  const estimatedMinor = estimateMinor(body.data.cbm, body.data.weightKg, body.data.mode);
+  if (body.data.orderId) {
+    const order = await prisma.marketOrder.findFirst({
+      where: { id: body.data.orderId, userId: req.user!.id },
+    });
+    if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  }
+
+  const estimatedMinor = await estimateMinor(body.data.cbm, body.data.weightKg, body.data.mode);
   const result = await prisma.$transaction(async (tx) => {
     const request = await tx.shippingQuoteRequest.create({
-      data: { userId: req.user!.id, ...body.data },
+      data: {
+        userId: req.user!.id,
+        cargoDesc: body.data.cargoDesc,
+        cbm: body.data.cbm,
+        weightKg: body.data.weightKg,
+        origin: body.data.origin,
+        destination: body.data.destination,
+        mode: body.data.mode,
+        orderId: body.data.orderId ?? null,
+        destinationDelivery: body.data.destinationDelivery ?? null,
+      },
     });
     const quote = await tx.shippingQuote.create({
       data: {
@@ -65,6 +81,12 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
         validUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       },
     });
+    if (body.data.orderId) {
+      await tx.marketOrder.update({
+        where: { id: body.data.orderId },
+        data: { logisticsStatus: "QUOTE_PENDING" },
+      });
+    }
     return { request, quote };
   });
   return ok(res, serialize(result), 201);
@@ -102,11 +124,12 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
     .safeParse(req.body ?? {});
   const quote = await prisma.shippingQuote.findUnique({
     where: { id: req.params.quoteId },
-    include: { request: true },
+    include: { request: true, shipment: true },
   });
   if (!quote || quote.request.userId !== req.user!.id) {
     return fail(res, 404, "NOT_FOUND", "Quote not found");
   }
+  if (quote.shipment) return fail(res, 400, "ALREADY_BOOKED", "Quote already booked");
   if (quote.validUntil < new Date()) return fail(res, 400, "EXPIRED", "Quote expired");
 
   try {
@@ -183,6 +206,12 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
         status: "HELD",
         icon: "ship",
       });
+      if (quote.request.orderId) {
+        await tx.marketOrder.update({
+          where: { id: quote.request.orderId },
+          data: { shipmentId: s.id, logisticsStatus: "BOOKED" },
+        });
+      }
       return tx.shipment.findUnique({
         where: { id: s.id },
         include: { hold: true, events: true, quote: true },
@@ -223,7 +252,9 @@ logisticsRouter.get("/shipments/:id", requireAuth, async (req, res) => {
       settlement: true,
       events: { orderBy: { createdAt: "asc" } },
       documents: true,
+      claims: { orderBy: { createdAt: "desc" } },
       quote: { include: { request: true } },
+      marketOrder: { select: { id: true, status: true, logisticsStatus: true } },
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Shipment not found");
@@ -231,14 +262,6 @@ logisticsRouter.get("/shipments/:id", requireAuth, async (req, res) => {
 });
 
 logisticsRouter.post("/shipments/:id/advance", requireAuth, async (req, res) => {
-  const NEXT: Record<string, "IN_TRANSIT" | "CUSTOMS" | "SETTLEMENT_PENDING" | "READY_FOR_POD" | "DELIVERED"> = {
-    HOLD_LOCKED: "IN_TRANSIT",
-    IN_TRANSIT: "CUSTOMS",
-    CUSTOMS: "SETTLEMENT_PENDING",
-    SETTLEMENT_PENDING: "READY_FOR_POD",
-    TOP_UP_REQUIRED: "READY_FOR_POD",
-    READY_FOR_POD: "DELIVERED",
-  };
   const body = z
     .object({
       status: z.enum(["IN_TRANSIT", "CUSTOMS", "SETTLEMENT_PENDING", "READY_FOR_POD", "DELIVERED"]).optional(),
@@ -246,122 +269,47 @@ logisticsRouter.post("/shipments/:id/advance", requireAuth, async (req, res) => 
     })
     .safeParse(req.body ?? {});
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid status");
-  const shipment = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
-  });
-  if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
-  const status = body.data.status ?? NEXT[shipment.status];
-  if (!status) return fail(res, 400, "BAD_STATE", `Cannot advance from ${shipment.status}`);
-  const updated = await prisma.$transaction(async (tx) => {
-    await tx.shipmentEvent.create({
-      data: {
-        shipmentId: shipment.id,
-        status,
-        message: body.data.message ?? status.replace(/_/g, " "),
-      },
+  try {
+    const updated = await advanceShipmentOps({
+      shipmentId: req.params.id,
+      userId: req.user!.id,
+      status: body.data.status,
+      message: body.data.message,
     });
-    return tx.shipment.update({
-      where: { id: shipment.id },
-      data: { status },
-      include: { events: true, hold: true },
-    });
-  });
-  const user = await prisma.user.findUnique({
-    where: { id: req.user!.id },
-    select: { email: true, name: true, notificationPrefs: true },
-  });
-  notifyUserEmail(
-    user,
-    "emailShipments",
-    `Shipment update · ${shipment.ref}`,
-    `Hi ${user?.name ?? "there"},\n\nShipment ${shipment.ref} is now ${status.replace(/_/g, " ").toLowerCase()}.\n\n— MagnetPay`,
-  );
-  return ok(res, serialize(updated));
+    return ok(res, serialize(updated));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Advance failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    if (msg.includes("proof-of-delivery")) return fail(res, 400, "POD_REQUIRED", msg);
+    return fail(res, 400, "BAD_STATE", msg);
+  }
 });
 
 logisticsRouter.post("/shipments/:id/settle", requireAuth, async (req, res) => {
   const body = z
-    .object({ finalMinor: z.union([z.string(), z.number()]) })
+    .object({
+      finalMinor: z.union([z.string(), z.number()]).optional(),
+      breakdown: z
+        .array(z.object({ label: z.string().min(1), amountMinor: z.number().int().positive() }))
+        .optional(),
+      notes: z.string().optional(),
+    })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "finalMinor required");
-  const finalMinor = BigInt(body.data.finalMinor);
-  const shipment = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
-    include: { hold: true, settlement: true },
-  });
-  if (!shipment?.hold) return fail(res, 404, "NOT_FOUND", "Shipment/hold not found");
-  if (shipment.settlement) return fail(res, 400, "ALREADY_SETTLED", "Already settled");
-
-  const locked = shipment.hold.lockedMinor;
-  const currency = shipment.hold.currency;
-
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid settle payload");
   try {
-    const result = await prisma.$transaction(async (tx) => {
-      let cashbackMinor = 0n;
-      let topUpMinor = 0n;
-      let nextStatus: "READY_FOR_POD" | "TOP_UP_REQUIRED" = "READY_FOR_POD";
-
-      if (finalMinor < locked) {
-        cashbackMinor = locked - finalMinor;
-        await consumeHold(tx, req.user!.id, currency, finalMinor, "LOGISTICS_HOLD", "Logistics final charge");
-        await unlockHoldCashback(
-          tx,
-          req.user!.id,
-          currency,
-          cashbackMinor,
-          "LOGISTICS_HOLD",
-          "Logistics cashback",
-        );
-        await recordTx(tx, {
-          userId: req.user!.id,
-          kind: "logistics_cashback",
-          title: `Cashback ${shipment.ref}`,
-          currency,
-          amountDisplay: `+${formatMoney(currency, cashbackMinor)}`,
-          amountPositive: true,
-          icon: "ship",
-        });
-      } else if (finalMinor > locked) {
-        topUpMinor = finalMinor - locked;
-        await consumeHold(tx, req.user!.id, currency, locked, "LOGISTICS_HOLD", "Logistics estimated charge");
-        nextStatus = "TOP_UP_REQUIRED";
-        await tx.notification.create({
-          data: {
-            userId: req.user!.id,
-            title: "Top-up required",
-            body: `Shipment ${shipment.ref} needs ${formatMoney(currency, topUpMinor)} more after customs.`,
-          },
-        });
-      } else {
-        await consumeHold(tx, req.user!.id, currency, locked, "LOGISTICS_HOLD", "Logistics final charge");
-      }
-
-      const settlement = await tx.shipmentSettlement.create({
-        data: {
-          shipmentId: shipment.id,
-          finalMinor,
-          currency,
-          cashbackMinor,
-          topUpMinor,
-        },
-      });
-      await tx.shipmentEvent.create({
-        data: {
-          shipmentId: shipment.id,
-          status: nextStatus,
-          message: `Settled final ${formatMoney(currency, finalMinor)}`,
-        },
-      });
-      const s = await tx.shipment.update({
-        where: { id: shipment.id },
-        data: { status: nextStatus },
-        include: { hold: true, settlement: true, events: true },
-      });
-      return { shipment: s, settlement };
+    const result = await settleShipmentOps({
+      shipmentId: req.params.id,
+      userId: req.user!.id,
+      finalMinor: body.data.finalMinor != null ? BigInt(body.data.finalMinor) : undefined,
+      breakdown: body.data.breakdown,
+      notes: body.data.notes,
     });
     return ok(res, serialize(result));
   } catch (e) {
-    return fail(res, 400, "SETTLE_FAILED", e instanceof Error ? e.message : "Settle failed");
+    const msg = e instanceof Error ? e.message : "Settle failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    if (msg.includes("Already settled")) return fail(res, 400, "ALREADY_SETTLED", msg);
+    return fail(res, 400, "SETTLE_FAILED", msg);
   }
 });
 
@@ -421,12 +369,23 @@ logisticsRouter.post("/shipments/:id/claim", requireAuth, async (req, res) => {
     where: { id, userId: req.user!.id },
   });
   if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
-  const event = await prisma.$transaction(async (tx) => {
-    const e = await tx.shipmentEvent.create({
+  const result = await prisma.$transaction(async (tx) => {
+    const claim = await tx.shipmentClaim.create({
+      data: {
+        shipmentId: shipment.id,
+        userId: req.user!.id,
+        type: body.data.type,
+        amountMinor: body.data.amountMinor != null ? BigInt(body.data.amountMinor) : null,
+        currency: "NGN",
+        description: body.data.description,
+        evidenceUrls: body.data.evidenceUrls ?? [],
+      },
+    });
+    await tx.shipmentEvent.create({
       data: {
         shipmentId: shipment.id,
         status: shipment.status,
-        message: `Claim (${body.data.type}): ${body.data.description.slice(0, 120)}`,
+        message: `Claim filed (${body.data.type}): ${body.data.description.slice(0, 120)}`,
       },
     });
     await tx.notification.create({
@@ -436,9 +395,21 @@ logisticsRouter.post("/shipments/:id/claim", requireAuth, async (req, res) => {
         body: `${shipment.ref} · ${body.data.type}`,
       },
     });
-    return e;
+    return claim;
   });
-  return ok(res, serialize({ event, shipmentId: shipment.id, ref: shipment.ref }), 201);
+  return ok(res, serialize({ claim: result, shipmentId: shipment.id, ref: shipment.ref }), 201);
+});
+
+logisticsRouter.get("/shipments/:id/claims", requireAuth, async (req, res) => {
+  const shipment = await prisma.shipment.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+  });
+  if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
+  const claims = await prisma.shipmentClaim.findMany({
+    where: { shipmentId: shipment.id },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(claims));
 });
 
 logisticsRouter.post("/shipments/:id/documents", requireAuth, async (req, res) => {
@@ -446,12 +417,18 @@ logisticsRouter.post("/shipments/:id/documents", requireAuth, async (req, res) =
     .object({ kind: z.string().min(1), name: z.string().min(1), url: z.string().min(4) })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
-  const shipment = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
-  });
-  if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
-  const doc = await prisma.shipmentDocument.create({
-    data: { shipmentId: shipment.id, kind: body.data.kind, name: body.data.name, url: body.data.url },
-  });
-  return ok(res, serialize(doc), 201);
+  try {
+    const doc = await attachShipmentDocument({
+      shipmentId: String(req.params.id),
+      userId: req.user!.id,
+      kind: body.data.kind,
+      name: body.data.name,
+      url: body.data.url,
+    });
+    return ok(res, serialize(doc), 201);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Upload failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    return fail(res, 400, "UPLOAD_FAILED", msg);
+  }
 });

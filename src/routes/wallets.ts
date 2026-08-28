@@ -118,7 +118,7 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
         `Deposit ${body.data.currency}`,
         deposit.id,
       );
-      await recordTx(tx, {
+      const transaction = await recordTx(tx, {
         userId: req.user!.id,
         kind: "deposit",
         title: "Wallet funded",
@@ -129,13 +129,14 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
         status: "SUCCEEDED",
         icon: "arrow-down-left",
       });
-      return deposit;
+      return { deposit, transaction };
     });
     const digits = (user?.id ?? "").replace(/\D/g, "").padEnd(10, "0").slice(0, 10);
     return ok(
       res,
       serialize({
-        ...result,
+        ...result.deposit,
+        transactionId: result.transaction.id,
         virtualAccount: {
           bank: "Wema Bank (Providus)",
           number: `${digits.slice(0, 4)} ${digits.slice(4, 7)} ${digits.slice(7)}`,

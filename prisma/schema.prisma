@@ -95,6 +95,25 @@ enum OrderStatus {
   CANCELLED
 }
 
+enum DeliveryMethod {
+  PICKUP
+  DOORSTEP
+}
+
+enum LogisticsStatus {
+  NOT_BOOKED
+  QUOTE_PENDING
+  BOOKED
+  IN_TRANSIT
+  DELIVERED
+}
+
+enum ClaimStatus {
+  OPEN
+  RESOLVED
+  REJECTED
+}
+
 enum DepositStatus {
   PENDING
   SUCCEEDED
@@ -176,6 +195,7 @@ model User {
   disputes        Dispute[]       @relation("DisputeOpener")
   quoteRequests   ShippingQuoteRequest[]
   shipments       Shipment[]
+  shipmentClaims  ShipmentClaim[]
   conversations   ConversationParticipant[]
   messages        Message[]
   notifications   Notification[]
@@ -472,6 +492,13 @@ model Product {
   stock       Int?
   variantAxes Json?
   pricingTiers Json?
+  cbmPerUnit       Float?
+  weightKgPerUnit  Float?
+  originHub        String?
+  leadTimeMin      Int?
+  leadTimeMax      Int?
+  packagingType    String?
+  defaultIncoterm  String?        @default("FOB")
   active      Boolean        @default(true)
   createdAt   DateTime       @default(now())
   store       SellerStore    @relation(fields: [storeId], references: [id], onDelete: Cascade)
@@ -547,12 +574,19 @@ model MarketOrder {
   tracking    String?
   carrier     String?
   sellerNote  String?     @db.Text
+  shipmentId  String?     @unique
+  deliveryMethod   DeliveryMethod?
+  deliveryAddress  Json?
+  logisticsStatus  LogisticsStatus @default(NOT_BOOKED)
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
   user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shipment    Shipment?   @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
   items       OrderItem[]
+  quoteRequests ShippingQuoteRequest[]
 
   @@index([userId])
+  @@index([shipmentId])
 }
 
 model OrderItem {
@@ -718,19 +752,23 @@ model Dispute {
 }
 
 model ShippingQuoteRequest {
-  id          String     @id @default(uuid())
-  userId      String
-  cargoDesc   String
-  cbm         Float
-  weightKg    Float
-  origin      String
-  destination String
-  mode        ShipMode   @default(SEA)
-  createdAt   DateTime   @default(now())
-  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  quotes      ShippingQuote[]
+  id                  String          @id @default(uuid())
+  userId              String
+  orderId             String?
+  cargoDesc           String
+  cbm                 Float
+  weightKg            Float
+  origin              String
+  destination         String
+  mode                ShipMode        @default(SEA)
+  destinationDelivery DeliveryMethod?
+  createdAt           DateTime        @default(now())
+  user                User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order               MarketOrder?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  quotes              ShippingQuote[]
 
   @@index([userId])
+  @@index([orderId])
 }
 
 model ShippingQuote {
@@ -763,6 +801,8 @@ model Shipment {
   settlement  ShipmentSettlement?
   events      ShipmentEvent[]
   documents   ShipmentDocument[]
+  claims      ShipmentClaim[]
+  marketOrder MarketOrder?
 
   @@index([userId])
 }
@@ -777,14 +817,16 @@ model ShipmentHold {
 }
 
 model ShipmentSettlement {
-  id          String   @id @default(uuid())
-  shipmentId  String   @unique
-  finalMinor  BigInt
-  currency    Currency @default(NGN)
-  cashbackMinor BigInt @default(0)
-  topUpMinor  BigInt   @default(0)
-  settledAt   DateTime @default(now())
-  shipment    Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  id            String   @id @default(uuid())
+  shipmentId    String   @unique
+  finalMinor    BigInt
+  currency      Currency @default(NGN)
+  cashbackMinor BigInt   @default(0)
+  topUpMinor    BigInt   @default(0)
+  breakdown     Json?
+  notes         String?  @db.Text
+  settledAt     DateTime @default(now())
+  shipment      Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
 }
 
 model ShipmentEvent {
@@ -808,6 +850,25 @@ model ShipmentDocument {
   shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
 
   @@index([shipmentId])
+}
+
+model ShipmentClaim {
+  id           String      @id @default(uuid())
+  shipmentId   String
+  userId       String
+  type         String
+  amountMinor  BigInt?
+  currency     Currency    @default(NGN)
+  description  String      @db.Text
+  evidenceUrls Json        @default("[]")
+  status       ClaimStatus @default(OPEN)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  shipment     Shipment    @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId])
+  @@index([userId])
 }
 
 model Conversation {
@@ -862,6 +923,43 @@ model Notification {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
+}
+
+enum LogisticsPartnerKind {
+  FREIGHT_FORWARDER
+  WAREHOUSE
+  CUSTOMS_BROKER
+  LAST_MILE
+}
+
+model LogisticsPartner {
+  id           String               @id @default(uuid())
+  name         String
+  code         String               @unique
+  kind         LogisticsPartnerKind @default(FREIGHT_FORWARDER)
+  modes        Json                 @default("[\"SEA\"]")
+  active       Boolean              @default(true)
+  rating       Float?
+  serviceLabel String?
+  contactName  String?
+  contactPhone String?
+  contactEmail String?
+  notes        String?              @db.Text
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  @@index([active])
+}
+
+model FreightPricing {
+  id                    String   @id @default("default")
+  airBaseMinor          Int      @default(450000)
+  seaBaseMinor          Int      @default(180000)
+  expressBaseMinor      Int      @default(600000)
+  consolidatedBaseMinor Int      @default(220000)
+  cbmMultiplier         Int      @default(100000)
+  weightMultiplier      Int      @default(2500)
+  updatedAt             DateTime @updatedAt
 }
 
 model AuditLog {

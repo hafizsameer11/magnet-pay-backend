@@ -15,6 +15,44 @@ import {
 
 export const marketRouter = Router();
 
+const productShippingSchema = {
+  cbmPerUnit: z.number().positive().optional(),
+  weightKgPerUnit: z.number().positive().optional(),
+  originHub: z.string().min(1).optional(),
+  leadTimeMin: z.number().int().nonnegative().optional(),
+  leadTimeMax: z.number().int().nonnegative().optional(),
+  packagingType: z.string().min(1).optional(),
+  defaultIncoterm: z.string().min(2).optional(),
+};
+
+function orderLogisticsNextAction(order: {
+  logisticsStatus: string;
+  shipment?: { id: string; ref: string; status: string } | null;
+}): string {
+  if (order.shipment?.status === "TOP_UP_REQUIRED") return "TOP_UP_REQUIRED";
+  if (order.shipment?.status === "READY_FOR_POD") return "CONFIRM_POD";
+  if (order.shipment) return "TRACK_SHIPMENT";
+  if (order.logisticsStatus === "QUOTE_PENDING") return "COMPLETE_BOOKING";
+  return "BOOK_FREIGHT";
+}
+
+function shipmentSummary(shipment: {
+  id: string;
+  ref: string;
+  route: string;
+  status: string;
+  eta?: string | null;
+} | null | undefined) {
+  if (!shipment) return null;
+  return {
+    id: shipment.id,
+    ref: shipment.ref,
+    route: shipment.route,
+    status: shipment.status,
+    eta: shipment.eta ?? null,
+  };
+}
+
 async function syncProductVariants(
   tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
   productId: string,
@@ -189,6 +227,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
       pricingTiers: z
         .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
         .optional(),
+      ...productShippingSchema,
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -208,6 +247,13 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
         ...(body.data.variantAxes !== undefined ? { variantAxes: body.data.variantAxes } : {}),
         ...(body.data.pricingTiers !== undefined ? { pricingTiers: body.data.pricingTiers } : {}),
+        ...(body.data.cbmPerUnit !== undefined ? { cbmPerUnit: body.data.cbmPerUnit } : {}),
+        ...(body.data.weightKgPerUnit !== undefined ? { weightKgPerUnit: body.data.weightKgPerUnit } : {}),
+        ...(body.data.originHub !== undefined ? { originHub: body.data.originHub } : {}),
+        ...(body.data.leadTimeMin !== undefined ? { leadTimeMin: body.data.leadTimeMin } : {}),
+        ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
+        ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
+        ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
       },
     });
     const urls = body.data.mediaUrls ?? (body.data.imageUrl ? [body.data.imageUrl] : []);
@@ -254,6 +300,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
       pricingTiers: z
         .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
         .optional(),
+      ...productShippingSchema,
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
@@ -271,6 +318,13 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
         ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
         ...(body.data.variantAxes !== undefined ? { variantAxes: body.data.variantAxes } : {}),
         ...(body.data.pricingTiers !== undefined ? { pricingTiers: body.data.pricingTiers } : {}),
+        ...(body.data.cbmPerUnit !== undefined ? { cbmPerUnit: body.data.cbmPerUnit } : {}),
+        ...(body.data.weightKgPerUnit !== undefined ? { weightKgPerUnit: body.data.weightKgPerUnit } : {}),
+        ...(body.data.originHub !== undefined ? { originHub: body.data.originHub } : {}),
+        ...(body.data.leadTimeMin !== undefined ? { leadTimeMin: body.data.leadTimeMin } : {}),
+        ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
+        ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
+        ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
       },
     });
     if (body.data.mediaUrls) {
@@ -359,6 +413,17 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
     where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (body.data.status === "SHIPPED") {
+    const tracking = body.data.tracking ?? order.tracking;
+    if (!tracking?.trim()) {
+      return fail(res, 400, "TRACKING_REQUIRED", "Enter tracking / B/L before marking shipped");
+    }
+    const meta = await sellerMeta(req.user!.id);
+    const docs = ((meta.orderDocs as Record<string, unknown[]>) ?? {})[order.id] ?? [];
+    if (!docs.length) {
+      return fail(res, 400, "DOCS_REQUIRED", "Upload shipping documents before dispatch");
+    }
+  }
   if (body.data.status === "SHIPPED" && !["IN_ESCROW", "SHIPPED"].includes(order.status)) {
     return fail(res, 400, "BAD_STATUS", `Cannot mark shipped from ${order.status}`);
   }
@@ -586,6 +651,7 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
     .object({
       addressLabel: z.string().optional(),
       addressLine: z.string().optional(),
+      deliveryMethod: z.enum(["PICKUP", "DOORSTEP"]).optional(),
     })
     .safeParse(req.body ?? {});
   const cart = await prisma.cart.findUnique({
@@ -651,6 +717,12 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
           currency,
           supplier,
           escrowId: escrow.id,
+          deliveryMethod: body.success && body.data.deliveryMethod ? body.data.deliveryMethod : "PICKUP",
+          deliveryAddress:
+            body.success && (body.data.addressLabel || body.data.addressLine)
+              ? { addressLabel: body.data.addressLabel ?? null, addressLine: body.data.addressLine ?? null }
+              : undefined,
+          logisticsStatus: "NOT_BOOKED",
           items: {
             create: cart.items.map((i) => {
               const unitMinor = unitMinorForCartItem(i);
@@ -722,8 +794,14 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
         await tx.notification.create({
           data: {
             userId: req.user!.id,
-            title: "Shipping address saved",
-            body: [body.data.addressLabel, body.data.addressLine].filter(Boolean).join(" · "),
+            title: "Delivery preference saved",
+            body: [
+              body.data.deliveryMethod === "DOORSTEP" ? "Doorstep delivery" : "Warehouse pickup",
+              body.data.addressLabel,
+              body.data.addressLine,
+            ]
+              .filter(Boolean)
+              .join(" · "),
           },
         });
       }
@@ -749,10 +827,34 @@ marketRouter.get("/orders", requireAuth, async (req, res) => {
 marketRouter.get("/orders/:id", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
     where: { id: req.params.id, userId: req.user!.id },
-    include: { items: { include: { product: true, variant: true } } },
+    include: {
+      items: { include: { product: true, variant: true } },
+      shipment: { select: { id: true, ref: true, route: true, status: true, eta: true } },
+    },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
-  return ok(res, serialize(order));
+  return ok(
+    res,
+    serialize({
+      ...order,
+      shipment: shipmentSummary(order.shipment),
+      logisticsNextAction: orderLogisticsNextAction(order),
+    }),
+  );
+});
+
+marketRouter.get("/orders/:id/documents", requireAuth, async (req, res) => {
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const store = await prisma.sellerStore.findFirst({
+    where: { OR: [{ id: order.supplier }, { name: order.supplier }] },
+  });
+  if (!store) return ok(res, []);
+  const meta = await sellerMeta(store.userId);
+  const all = (meta.orderDocs as Record<string, unknown[]>) ?? {};
+  return ok(res, all[order.id] ?? []);
 });
 
 marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {

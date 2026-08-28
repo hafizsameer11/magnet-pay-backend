@@ -87,6 +87,8 @@ async function main() {
   await prisma.user.deleteMany();
   await prisma.fxRate.deleteMany();
   await prisma.feeConfig.deleteMany();
+  await prisma.logisticsPartner.deleteMany();
+  await prisma.freightPricing.deleteMany();
   await prisma.featureFlag.deleteMany();
 
   const passcodeHash = await bcrypt.hash("123456", 10);
@@ -212,6 +214,46 @@ async function main() {
     data: [
       { key: "escrow_fee_bps", value: 150 },
       { key: "transfer_fee_bps", value: 75 },
+    ],
+  });
+
+  await prisma.freightPricing.create({
+    data: { id: "default" },
+  });
+
+  await prisma.logisticsPartner.createMany({
+    data: [
+      {
+        name: "MagnetPay Logistics",
+        code: "MAGNET",
+        kind: "FREIGHT_FORWARDER",
+        modes: ["SEA", "AIR", "EXPRESS", "CONSOLIDATED"],
+        active: true,
+        rating: 4.9,
+        serviceLabel: "Door-to-door · China → Nigeria",
+        contactName: "Ops Desk",
+        contactPhone: "+2348000000001",
+        contactEmail: "ops@magnetpay.test",
+        notes: "Primary in-house freight partner.",
+      },
+      {
+        name: "ChinaSea Express",
+        code: "CHINASEA",
+        kind: "FREIGHT_FORWARDER",
+        modes: ["SEA", "CONSOLIDATED"],
+        active: true,
+        rating: 4.7,
+        serviceLabel: "LCL · Guangzhou → Lagos",
+      },
+      {
+        name: "Pacific Direct Freight",
+        code: "PACIFIC",
+        kind: "FREIGHT_FORWARDER",
+        modes: ["SEA", "EXPRESS"],
+        active: false,
+        rating: 4.8,
+        serviceLabel: "Express sea lane",
+      },
     ],
   });
 

@@ -5,6 +5,15 @@ import { z } from "zod";
 import { deliverUserNotification } from "../services/deliver.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
+import { getFreightPricing, estimateFreightMinor, DEFAULT_FREIGHT_PRICING } from "../services/freight-pricing.js";
+import {
+  advanceShipmentOps,
+  settleShipmentOps,
+  attachShipmentDocument,
+  removeShipmentDocument,
+  SHIPMENT_DOCUMENT_KINDS,
+  SHIPMENT_NEXT,
+} from "../services/shipment-ops.js";
 
 export const notificationsRouter = Router();
 export const messagesRouter = Router();
@@ -1253,4 +1262,314 @@ adminRouter.put("/fees/:id", async (req, res) => {
     },
   });
   return ok(res, serialize(row));
+});
+
+adminRouter.get("/logistics/pricing", async (_req, res) => {
+  const row = await getFreightPricing();
+  return ok(res, serialize(row));
+});
+
+adminRouter.put("/logistics/pricing", async (req, res) => {
+  const body = z
+    .object({
+      airBaseMinor: z.number().int().nonnegative(),
+      seaBaseMinor: z.number().int().nonnegative(),
+      expressBaseMinor: z.number().int().nonnegative(),
+      consolidatedBaseMinor: z.number().int().nonnegative(),
+      cbmMultiplier: z.number().int().positive(),
+      weightMultiplier: z.number().int().positive(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid freight pricing");
+
+  const row = await prisma.freightPricing.upsert({
+    where: { id: "default" },
+    create: { id: "default", ...body.data },
+    update: body.data,
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "logistics.pricing.update",
+      entity: "FreightPricing",
+      entityId: row.id,
+      meta: body.data,
+    },
+  });
+  return ok(res, serialize(row));
+});
+
+adminRouter.post("/logistics/pricing/preview", async (req, res) => {
+  const body = z
+    .object({
+      cbm: z.number().positive(),
+      weightKg: z.number().positive(),
+      mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).default("SEA"),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid preview input");
+  const config = await getFreightPricing();
+  const estimatedMinor = estimateFreightMinor(body.data.cbm, body.data.weightKg, body.data.mode, config);
+  return ok(
+    res,
+    serialize({
+      ...body.data,
+      estimatedMinor,
+      formula: `base(${body.data.mode}) + ceil(cbm×${config.cbmMultiplier}) + ceil(kg×${config.weightMultiplier})`,
+    }),
+  );
+});
+
+adminRouter.get("/logistics/partners", async (_req, res) => {
+  const rows = await prisma.logisticsPartner.findMany({ orderBy: [{ active: "desc" }, { name: "asc" }] });
+  return ok(res, serialize(rows));
+});
+
+adminRouter.get("/logistics/partners/:id", async (req, res) => {
+  const row = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  if (!row) return fail(res, 404, "NOT_FOUND", "Partner not found");
+  return ok(res, serialize(row));
+});
+
+adminRouter.post("/logistics/partners", async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(2),
+      code: z.string().min(2).max(32),
+      kind: z.enum(["FREIGHT_FORWARDER", "WAREHOUSE", "CUSTOMS_BROKER", "LAST_MILE"]).default("FREIGHT_FORWARDER"),
+      modes: z.array(z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"])).min(1),
+      active: z.boolean().default(true),
+      rating: z.number().min(0).max(5).optional(),
+      serviceLabel: z.string().optional(),
+      contactName: z.string().optional(),
+      contactPhone: z.string().optional(),
+      contactEmail: z.string().email().optional().or(z.literal("")),
+      notes: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid partner");
+
+  const row = await prisma.logisticsPartner.create({
+    data: {
+      name: body.data.name,
+      code: body.data.code.toUpperCase(),
+      kind: body.data.kind,
+      modes: body.data.modes,
+      active: body.data.active,
+      rating: body.data.rating,
+      serviceLabel: body.data.serviceLabel,
+      contactName: body.data.contactName,
+      contactPhone: body.data.contactPhone,
+      contactEmail: body.data.contactEmail || null,
+      notes: body.data.notes,
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "logistics.partner.create",
+      entity: "LogisticsPartner",
+      entityId: row.id,
+      meta: { code: row.code, name: row.name },
+    },
+  });
+  return ok(res, serialize(row), 201);
+});
+
+adminRouter.patch("/logistics/partners/:id", async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(2).optional(),
+      code: z.string().min(2).max(32).optional(),
+      kind: z.enum(["FREIGHT_FORWARDER", "WAREHOUSE", "CUSTOMS_BROKER", "LAST_MILE"]).optional(),
+      modes: z.array(z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"])).min(1).optional(),
+      active: z.boolean().optional(),
+      rating: z.number().min(0).max(5).nullable().optional(),
+      serviceLabel: z.string().nullable().optional(),
+      contactName: z.string().nullable().optional(),
+      contactPhone: z.string().nullable().optional(),
+      contactEmail: z.string().email().nullable().optional().or(z.literal("")),
+      notes: z.string().nullable().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid partner update");
+
+  const existing = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Partner not found");
+
+  const row = await prisma.logisticsPartner.update({
+    where: { id: req.params.id },
+    data: {
+      ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+      ...(body.data.code !== undefined ? { code: body.data.code.toUpperCase() } : {}),
+      ...(body.data.kind !== undefined ? { kind: body.data.kind } : {}),
+      ...(body.data.modes !== undefined ? { modes: body.data.modes } : {}),
+      ...(body.data.active !== undefined ? { active: body.data.active } : {}),
+      ...(body.data.rating !== undefined ? { rating: body.data.rating } : {}),
+      ...(body.data.serviceLabel !== undefined ? { serviceLabel: body.data.serviceLabel } : {}),
+      ...(body.data.contactName !== undefined ? { contactName: body.data.contactName } : {}),
+      ...(body.data.contactPhone !== undefined ? { contactPhone: body.data.contactPhone } : {}),
+      ...(body.data.contactEmail !== undefined ? { contactEmail: body.data.contactEmail || null } : {}),
+      ...(body.data.notes !== undefined ? { notes: body.data.notes } : {}),
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "logistics.partner.update",
+      entity: "LogisticsPartner",
+      entityId: row.id,
+      meta: { code: row.code, active: row.active },
+    },
+  });
+  return ok(res, serialize(row));
+});
+
+adminRouter.get("/logistics/shipment-flow", async (_req, res) => {
+  return ok(res, serialize({ next: SHIPMENT_NEXT, defaults: DEFAULT_FREIGHT_PRICING }));
+});
+
+adminRouter.post("/shipments/:id/advance", async (req, res) => {
+  const body = z
+    .object({
+      status: z.enum(["IN_TRANSIT", "CUSTOMS", "SETTLEMENT_PENDING", "READY_FOR_POD", "DELIVERED"]).optional(),
+      message: z.string().optional(),
+      skipPodCheck: z.boolean().optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid advance payload");
+
+  try {
+    const updated = await advanceShipmentOps({
+      shipmentId: req.params.id,
+      status: body.data.status,
+      message: body.data.message,
+      skipPodCheck: body.data.skipPodCheck ?? true,
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "shipment.advance",
+        entity: "Shipment",
+        entityId: updated.id,
+        meta: { status: updated.status, ref: updated.ref },
+      },
+    });
+    return ok(res, serialize(updated));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Advance failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    return fail(res, 400, "BAD_STATE", msg);
+  }
+});
+
+adminRouter.post("/shipments/:id/settle", async (req, res) => {
+  const body = z
+    .object({
+      finalMinor: z.union([z.string(), z.number()]).optional(),
+      breakdown: z
+        .array(z.object({ label: z.string().min(1), amountMinor: z.number().int().positive() }))
+        .optional(),
+      notes: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid settle payload");
+
+  try {
+    const result = await settleShipmentOps({
+      shipmentId: req.params.id,
+      finalMinor: body.data.finalMinor != null ? BigInt(body.data.finalMinor) : undefined,
+      breakdown: body.data.breakdown,
+      notes: body.data.notes,
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "shipment.settle",
+        entity: "Shipment",
+        entityId: req.params.id,
+        meta: {
+          finalMinor: String(result.settlement.finalMinor),
+          topUpMinor: String(result.settlement.topUpMinor),
+          cashbackMinor: String(result.settlement.cashbackMinor),
+          breakdown: body.data.breakdown ?? null,
+        },
+      },
+    });
+    return ok(res, serialize(result));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Settle failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    if (msg.includes("Already settled")) return fail(res, 400, "ALREADY_SETTLED", msg);
+    return fail(res, 400, "SETTLE_FAILED", msg);
+  }
+});
+
+adminRouter.get("/shipments/:id/documents", async (req, res) => {
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: req.params.id },
+    include: { documents: { orderBy: { createdAt: "desc" } } },
+  });
+  if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
+  return ok(res, serialize(shipment.documents));
+});
+
+adminRouter.post("/shipments/:id/documents", async (req, res) => {
+  const body = z
+    .object({
+      kind: z.string().min(1),
+      name: z.string().min(1),
+      url: z.string().min(4),
+      note: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
+
+  try {
+    const doc = await attachShipmentDocument({
+      shipmentId: req.params.id,
+      kind: body.data.kind,
+      name: body.data.name,
+      url: body.data.url,
+      eventMessage: body.data.note?.trim() || `Ops uploaded: ${body.data.name}`,
+    });
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "shipment.document.add",
+        entity: "ShipmentDocument",
+        entityId: doc.id,
+        meta: { shipmentId: req.params.id, kind: body.data.kind, name: body.data.name },
+      },
+    });
+    return ok(res, serialize(doc), 201);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Upload failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    return fail(res, 400, "UPLOAD_FAILED", msg);
+  }
+});
+
+adminRouter.delete("/shipments/:id/documents/:docId", async (req, res) => {
+  try {
+    await removeShipmentDocument({ shipmentId: req.params.id, documentId: req.params.docId });
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "shipment.document.remove",
+        entity: "ShipmentDocument",
+        entityId: req.params.docId,
+        meta: { shipmentId: req.params.id },
+      },
+    });
+    return ok(res, serialize({ ok: true }));
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Delete failed";
+    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    return fail(res, 400, "DELETE_FAILED", msg);
+  }
+});
+
+adminRouter.get("/logistics/document-kinds", async (_req, res) => {
+  return ok(res, serialize(SHIPMENT_DOCUMENT_KINDS));
 });
