@@ -4,8 +4,52 @@ import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../lib/prisma.js";
 import { fail, ok, requireAuth, serialize } from "../lib/http.js";
 import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../services/ledger.js";
+import {
+  generateCombinations,
+  variantInputSchema,
+  variantKeyFromOptions,
+  variantLabelFromOptions,
+  type VariantAxis,
+  type VariantOptions,
+} from "../services/product-variants.js";
 
 export const marketRouter = Router();
+
+async function syncProductVariants(
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  productId: string,
+  basePriceMinor: bigint,
+  variantAxes: VariantAxis[] | undefined,
+  variants: z.infer<typeof variantInputSchema>[] | undefined,
+) {
+  await tx.productVariant.deleteMany({ where: { productId } });
+  let rows = variants ?? [];
+  if (!rows.length && variantAxes?.length) {
+    rows = generateCombinations(variantAxes).map((options) => ({
+      options,
+      priceMinor: basePriceMinor,
+    }));
+  }
+  for (const v of rows) {
+    await tx.productVariant.create({
+      data: {
+        productId,
+        sku: v.sku ?? null,
+        options: v.options,
+        priceMinor: BigInt(v.priceMinor),
+        stock: v.stock ?? null,
+        imageUrl: v.imageUrl ?? null,
+      },
+    });
+  }
+}
+
+function unitMinorForCartItem(item: {
+  product: { priceMinor: bigint };
+  variant?: { priceMinor: bigint } | null;
+}) {
+  return item.variant?.priceMinor ?? item.product.priceMinor;
+}
 
 async function sellerStoreFor(userId: string) {
   const owned = await prisma.sellerStore.findUnique({ where: { userId } });
@@ -58,6 +102,7 @@ marketRouter.get("/products/:id", async (req, res) => {
       store: true,
       category: true,
       media: { orderBy: { sortOrder: "asc" } },
+      variants: { where: { active: true }, orderBy: { createdAt: "asc" } },
       reviews: {
         include: { user: { select: { id: true, name: true, avatarUrl: true } } },
         orderBy: { createdAt: "desc" },
@@ -120,7 +165,7 @@ marketRouter.get("/seller/products", requireAuth, async (req, res) => {
   const store = await ensureSellerStore(req.user!.id);
   const products = await prisma.product.findMany({
     where: { storeId: store.id },
-    include: { category: true, media: { orderBy: { sortOrder: "asc" } } },
+    include: { category: true, media: { orderBy: { sortOrder: "asc" } }, variants: { where: { active: true } } },
     orderBy: { createdAt: "desc" },
   });
   return ok(res, serialize(products));
@@ -140,6 +185,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
       active: z.boolean().optional(),
       stock: z.number().int().nonnegative().optional().nullable(),
       variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+      variants: z.array(variantInputSchema).optional(),
       pricingTiers: z
         .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
         .optional(),
@@ -170,9 +216,18 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         data: { productId: p.id, url: urls[i], sortOrder: i },
       });
     }
+    if (body.data.variantAxes?.length || body.data.variants?.length) {
+      await syncProductVariants(
+        tx,
+        p.id,
+        BigInt(body.data.priceMinor),
+        body.data.variantAxes,
+        body.data.variants,
+      );
+    }
     return tx.product.findUnique({
       where: { id: p.id },
-      include: { media: true, category: true, store: true },
+      include: { media: true, category: true, store: true, variants: { where: { active: true } } },
     });
   });
   return ok(res, serialize(product), 201);
@@ -195,6 +250,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
       mediaUrls: z.array(z.string().url()).optional(),
       stock: z.number().int().nonnegative().optional().nullable(),
       variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+      variants: z.array(variantInputSchema).optional(),
       pricingTiers: z
         .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
         .optional(),
@@ -228,9 +284,21 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
         await tx.product.update({ where: { id: p.id }, data: { imageUrl: body.data.mediaUrls[0] } });
       }
     }
+    if (body.data.variantAxes !== undefined || body.data.variants !== undefined) {
+      const axes = (body.data.variantAxes ?? (existing.variantAxes as VariantAxis[] | null) ?? undefined) as
+        | VariantAxis[]
+        | undefined;
+      await syncProductVariants(
+        tx,
+        p.id,
+        body.data.priceMinor !== undefined ? BigInt(body.data.priceMinor) : existing.priceMinor,
+        axes,
+        body.data.variants,
+      );
+    }
     return tx.product.findUnique({
       where: { id: p.id },
-      include: { media: true, category: true },
+      include: { media: true, category: true, variants: { where: { active: true } } },
     });
   });
   return ok(res, serialize(product));
@@ -427,12 +495,12 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) 
 marketRouter.get("/cart", requireAuth, async (req, res) => {
   let cart = await prisma.cart.findUnique({
     where: { userId: req.user!.id },
-    include: { items: { include: { product: true } } },
+    include: { items: { include: { product: true, variant: true } } },
   });
   if (!cart) {
     cart = await prisma.cart.create({
       data: { userId: req.user!.id },
-      include: { items: { include: { product: true } } },
+      include: { items: { include: { product: true, variant: true } } },
     });
   }
   return ok(res, serialize(cart));
@@ -440,16 +508,51 @@ marketRouter.get("/cart", requireAuth, async (req, res) => {
 
 marketRouter.post("/cart/items", requireAuth, async (req, res) => {
   const body = z
-    .object({ productId: z.string().uuid(), qty: z.number().int().positive().default(1) })
+    .object({
+      productId: z.string().uuid(),
+      qty: z.number().int().positive().default(1),
+      variantId: z.string().uuid().optional(),
+    })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid cart item");
+  const product = await prisma.product.findUnique({
+    where: { id: body.data.productId, active: true },
+    include: { variants: { where: { active: true } } },
+  });
+  if (!product) return fail(res, 404, "NOT_FOUND", "Product not found");
+
+  let variantId: string | null = null;
+  let variantKey = "";
+  if (product.variants.length) {
+    if (!body.data.variantId) return fail(res, 400, "VARIANT_REQUIRED", "Select a variant");
+    const variant = product.variants.find((v) => v.id === body.data.variantId);
+    if (!variant) return fail(res, 400, "INVALID_VARIANT", "Variant not found");
+    variantId = variant.id;
+    variantKey = variantKeyFromOptions(variant.options as VariantOptions);
+    if (variant.stock != null && variant.stock < body.data.qty) {
+      return fail(res, 400, "OUT_OF_STOCK", "Not enough stock for this variant");
+    }
+  } else if (body.data.variantId) {
+    return fail(res, 400, "NO_VARIANTS", "Product has no variants");
+  } else if (product.stock != null && product.stock < body.data.qty) {
+    return fail(res, 400, "OUT_OF_STOCK", "Not enough stock");
+  }
+
   let cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
   if (!cart) cart = await prisma.cart.create({ data: { userId: req.user!.id } });
   const item = await prisma.cartItem.upsert({
-    where: { cartId_productId: { cartId: cart.id, productId: body.data.productId } },
-    create: { cartId: cart.id, productId: body.data.productId, qty: body.data.qty },
+    where: {
+      cartId_productId_variantKey: { cartId: cart.id, productId: product.id, variantKey },
+    },
+    create: {
+      cartId: cart.id,
+      productId: product.id,
+      variantId,
+      variantKey,
+      qty: body.data.qty,
+    },
     update: { qty: { increment: body.data.qty } },
-    include: { product: true },
+    include: { product: true, variant: true },
   });
   return ok(res, serialize(item), 201);
 });
@@ -464,7 +567,7 @@ marketRouter.patch("/cart/items/:id", requireAuth, async (req, res) => {
   const item = await prisma.cartItem.update({
     where: { id: existing.id },
     data: { qty: body.data.qty },
-    include: { product: true },
+    include: { product: true, variant: true },
   });
   return ok(res, serialize(item));
 });
@@ -487,7 +590,7 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
     .safeParse(req.body ?? {});
   const cart = await prisma.cart.findUnique({
     where: { userId: req.user!.id },
-    include: { items: { include: { product: { include: { store: true } } } } },
+    include: { items: { include: { product: { include: { store: true } }, variant: true } } },
   });
   if (!cart?.items.length) return fail(res, 400, "EMPTY_CART", "Cart is empty");
 
@@ -498,7 +601,7 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
 
   const currency = cart.items[0].product.currency;
   const goodsMinor = cart.items.reduce(
-    (s, i) => s + i.product.priceMinor * BigInt(i.qty),
+    (s, i) => s + unitMinorForCartItem(i) * BigInt(i.qty),
     0n,
   );
   const feeMinor = BigInt(Math.floor(Number(goodsMinor) * 0.009));
@@ -549,18 +652,35 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
           supplier,
           escrowId: escrow.id,
           items: {
-            create: cart.items.map((i) => ({
-              productId: i.productId,
-              title: i.product.title,
-              qty: i.qty,
-              priceMinor: i.product.priceMinor,
-            })),
+            create: cart.items.map((i) => {
+              const unitMinor = unitMinorForCartItem(i);
+              const variantLabel = i.variant
+                ? variantLabelFromOptions(i.variant.options as VariantOptions)
+                : null;
+              return {
+                productId: i.productId,
+                variantId: i.variantId,
+                variantLabel,
+                title: variantLabel ? `${i.product.title} (${variantLabel})` : i.product.title,
+                qty: i.qty,
+                priceMinor: unitMinor,
+              };
+            }),
           },
         },
         include: { items: true },
       });
       for (const item of cart.items) {
-        if (item.product.stock != null) {
+        const unitMinor = unitMinorForCartItem(item);
+        if (item.variantId && item.variant?.stock != null) {
+          if (item.variant.stock < item.qty) {
+            throw new Error(`Insufficient stock for ${item.product.title}`);
+          }
+          await tx.productVariant.update({
+            where: { id: item.variantId },
+            data: { stock: item.variant.stock - item.qty },
+          });
+        } else if (item.product.stock != null) {
           if (item.product.stock < item.qty) {
             throw new Error(`Insufficient stock for ${item.product.title}`);
           }
@@ -629,7 +749,7 @@ marketRouter.get("/orders", requireAuth, async (req, res) => {
 marketRouter.get("/orders/:id", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
     where: { id: req.params.id, userId: req.user!.id },
-    include: { items: { include: { product: true } } },
+    include: { items: { include: { product: true, variant: true } } },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   return ok(res, serialize(order));
@@ -656,10 +776,24 @@ marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
       where: { id: line.productId, active: true },
     });
     if (!product) continue;
+    let variantId: string | null = line.variantId;
+    let variantKey = "";
+    if (variantId) {
+      const variant = await prisma.productVariant.findFirst({
+        where: { id: variantId, productId: line.productId, active: true },
+      });
+      if (!variant) {
+        variantId = null;
+      } else {
+        variantKey = variantKeyFromOptions(variant.options as VariantOptions);
+      }
+    }
     await prisma.cartItem.create({
       data: {
         cartId: cart.id,
         productId: line.productId,
+        variantId,
+        variantKey,
         qty: line.qty,
       },
     });
@@ -667,7 +801,7 @@ marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
 
   const rebuilt = await prisma.cart.findUnique({
     where: { id: cart.id },
-    include: { items: { include: { product: { include: { store: true } } } } },
+    include: { items: { include: { product: { include: { store: true } }, variant: true } } },
   });
   if (!rebuilt?.items.length) {
     return fail(res, 400, "UNAVAILABLE", "None of the original products are available");
@@ -1126,11 +1260,14 @@ marketRouter.get("/rfq", requireAuth, async (req, res) => {
 });
 
 marketRouter.get("/seller/rfq", requireAuth, async (req, res) => {
+  const sellerId = req.user!.id;
   const rows = await prisma.rfq.findMany({
-    where: { status: "open" },
+    where: {
+      OR: [{ status: "open" }, { quotes: { some: { sellerId } } }],
+    },
     include: {
       buyer: { select: { id: true, name: true, phone: true, avatarUrl: true } },
-      quotes: { where: { sellerId: req.user!.id } },
+      quotes: { where: { sellerId } },
     },
     orderBy: { createdAt: "desc" },
     take: 50,
