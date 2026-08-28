@@ -1,10 +1,8 @@
 import type { Currency } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { formatMoney } from "./ledger.js";
-
-const NGN_TIER1_CAP = 500_000_00n;
-const NGN_TIER2_CAP = 20_000_000_00n;
-const CNY_DAILY_CAP = 200_000_00n;
+import { getComplianceLimits } from "./compliance-limits.js";
+import { getKycAccess, getKycLimitContext } from "./kyc-access.js";
 
 export type LimitKind = "deposit" | "withdraw" | "send";
 
@@ -14,27 +12,29 @@ export function startOfUtcDay() {
   return d;
 }
 
-export async function getKycLimitContext(userId: string) {
-  const latest = await prisma.kycApplication.findFirst({
-    where: { userId },
-    orderBy: { createdAt: "desc" },
-  });
-  const approved = latest?.status === "APPROVED";
-  const tier = latest?.tier ?? 1;
-  return {
-    status: latest?.status ?? "DRAFT",
-    tier,
-    approved,
-  };
+export { getKycLimitContext } from "./kyc-access.js";
+
+export async function ngnDailyCapMinor(userId: string) {
+  const [kyc, config] = await Promise.all([getKycLimitContext(userId), getComplianceLimits()]);
+
+  if (kyc.status === "REJECTED") return 0n;
+
+  if (kyc.approved && kyc.tier >= 2) {
+    return BigInt(config.ngnTier2DailyCapMinor);
+  }
+  if (kyc.approved && kyc.tier >= 1) {
+    return BigInt(config.ngnTier1DailyCapMinor);
+  }
+  if (kyc.status === "SUBMITTED" && config.allowBasicWhilePending) {
+    return BigInt(config.ngnTier1DailyCapMinor);
+  }
+
+  return BigInt(config.unverifiedNgnDailyCapMinor);
 }
 
-export function ngnDailyCapMinor(kyc: { approved: boolean; tier: number }) {
-  if (kyc.approved && kyc.tier >= 2) return NGN_TIER2_CAP;
-  return NGN_TIER1_CAP;
-}
-
-export function cnyDailyCapMinor() {
-  return CNY_DAILY_CAP;
+export async function cnyDailyCapMinor() {
+  const config = await getComplianceLimits();
+  return BigInt(config.cnyDailyCapMinor);
 }
 
 async function sumDepositsToday(userId: string, currency: Currency) {
@@ -89,19 +89,30 @@ function limitRow(currency: Currency, capMinor: bigint, usedMinor: bigint) {
 }
 
 export async function getWalletLimits(userId: string) {
-  const kyc = await getKycLimitContext(userId);
-  const ngnCap = ngnDailyCapMinor(kyc);
-  const cnyCap = cnyDailyCapMinor();
+  const [kyc, config, access, ngnCap, cnyCap] = await Promise.all([
+    getKycLimitContext(userId),
+    getComplianceLimits(),
+    getKycAccess(userId),
+    ngnDailyCapMinor(userId),
+    cnyDailyCapMinor(),
+  ]);
 
   const [ngnDepUsed, ngnWdUsed, cnySendUsed, cnyWdUsed] = await Promise.all([
     sumDepositsToday(userId, "NGN"),
     sumWithdrawalsToday(userId, "NGN"),
     sumTransfersToday(userId, "CNY"),
-    sumWithdrawalsToday(userId, "CNY"),
+    sumTransfersToday(userId, "CNY"),
   ]);
 
   return {
     kyc,
+    access,
+    caps: {
+      unverifiedNgnDailyCapMinor: config.unverifiedNgnDailyCapMinor,
+      ngnTier1DailyCapMinor: config.ngnTier1DailyCapMinor,
+      ngnTier2DailyCapMinor: config.ngnTier2DailyCapMinor,
+      cnyDailyCapMinor: config.cnyDailyCapMinor,
+    },
     ngn: {
       deposit: limitRow("NGN", ngnCap, ngnDepUsed),
       withdraw: limitRow("NGN", ngnCap, ngnWdUsed),

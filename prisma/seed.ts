@@ -2,6 +2,8 @@ import "dotenv/config";
 import bcrypt from "bcryptjs";
 import { PrismaClient } from "@prisma/client";
 import { ensureSystemAccounts, ensureUserLedgerAccounts } from "../src/services/ledger.js";
+import { DEFAULT_COMPLIANCE_LIMITS } from "../src/services/compliance-limits.js";
+import { seedAdminRecords } from "../src/services/admin-records-seed.js";
 
 const prisma = new PrismaClient();
 
@@ -89,6 +91,7 @@ async function main() {
   await prisma.feeConfig.deleteMany();
   await prisma.logisticsPartner.deleteMany();
   await prisma.freightPricing.deleteMany();
+  await prisma.complianceLimits.deleteMany();
   await prisma.featureFlag.deleteMany();
 
   const passcodeHash = await bcrypt.hash("123456", 10);
@@ -219,6 +222,10 @@ async function main() {
 
   await prisma.freightPricing.create({
     data: { id: "default" },
+  });
+
+  await prisma.complianceLimits.create({
+    data: { id: "default", ...DEFAULT_COMPLIANCE_LIMITS },
   });
 
   await prisma.logisticsPartner.createMany({
@@ -948,6 +955,8 @@ async function main() {
       },
     },
   });
+
+  await seedAdminRecords();
 
   console.log("Seed complete — rich catalog with app images");
   console.log({

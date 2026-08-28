@@ -962,6 +962,21 @@ model FreightPricing {
   updatedAt             DateTime @updatedAt
 }
 
+model ComplianceLimits {
+  id                        String   @id @default("default")
+  unverifiedNgnDailyCapMinor Int     @default(0)
+  ngnTier1DailyCapMinor     Int      @default(50000000)
+  ngnTier2DailyCapMinor     Int      @default(2000000000)
+  cnyDailyCapMinor          Int      @default(20000000)
+  minTierDeposit            Int      @default(1)
+  minTierWithdraw           Int      @default(1)
+  minTierCrossBorder        Int      @default(2)
+  minTierMarketCheckout     Int      @default(2)
+  minTierLogistics          Int      @default(2)
+  allowBasicWhilePending    Boolean  @default(true)
+  updatedAt                 DateTime @updatedAt
+}
+
 model AuditLog {
   id        String   @id @default(uuid())
   actorId   String?
@@ -1059,4 +1074,20 @@ model UserBlock {
 
   @@unique([userId, blockedUserId])
   @@index([userId])
+}
+
+model AdminRecord {
+  id         String   @id @default(uuid())
+  domain     String
+  externalId String?
+  title      String
+  subtitle   String?
+  status     String?
+  payload    Json     @default("{}")
+  sortOrder  Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([domain])
+  @@index([domain, status])
 }

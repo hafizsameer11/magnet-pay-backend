@@ -7,6 +7,10 @@ import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 import { getFreightPricing, estimateFreightMinor, DEFAULT_FREIGHT_PRICING } from "../services/freight-pricing.js";
 import {
+  getComplianceLimits,
+  updateComplianceLimits,
+} from "../services/compliance-limits.js";
+import {
   advanceShipmentOps,
   settleShipmentOps,
   attachShipmentDocument,
@@ -14,6 +18,13 @@ import {
   SHIPMENT_DOCUMENT_KINDS,
   SHIPMENT_NEXT,
 } from "../services/shipment-ops.js";
+import {
+  listAdminRecords,
+  getAdminRecord,
+  createAdminRecord,
+  patchAdminRecord,
+} from "../services/admin-records.js";
+import { seedAdminRecords } from "../services/admin-records-seed.js";
 
 export const notificationsRouter = Router();
 export const messagesRouter = Router();
@@ -958,6 +969,44 @@ adminRouter.get("/sellers", async (_req, res) => {
   return ok(res, serialize(rows));
 });
 
+adminRouter.get("/sellers/:id", async (req, res) => {
+  const row = await prisma.sellerStore.findUnique({
+    where: { id: req.params.id },
+    include: {
+      user: { select: userSelect },
+      products: { orderBy: { createdAt: "desc" }, take: 50 },
+      _count: { select: { products: true, members: true } },
+    },
+  });
+  if (!row) return fail(res, 404, "NOT_FOUND", "Seller store not found");
+  return ok(res, serialize(row));
+});
+
+adminRouter.patch("/sellers/:id", async (req, res) => {
+  const body = z
+    .object({
+      verified: z.boolean().optional(),
+      name: z.string().min(1).optional(),
+      description: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
+
+  const existing = await prisma.sellerStore.findUnique({ where: { id: req.params.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Seller store not found");
+
+  const row = await prisma.sellerStore.update({
+    where: { id: req.params.id },
+    data: body.data,
+    include: {
+      user: { select: userSelect },
+      products: { orderBy: { createdAt: "desc" }, take: 50 },
+      _count: { select: { products: true, members: true } },
+    },
+  });
+  return ok(res, serialize(row));
+});
+
 adminRouter.get("/reviews", async (_req, res) => {
   const rows = await prisma.review.findMany({
     include: {
@@ -1259,6 +1308,41 @@ adminRouter.put("/fees/:id", async (req, res) => {
       entity: "FeeConfig",
       entityId: row.id,
       meta: { key: row.key, value: row.value },
+    },
+  });
+  return ok(res, serialize(row));
+});
+
+adminRouter.get("/compliance/limits", async (_req, res) => {
+  const row = await getComplianceLimits();
+  return ok(res, serialize(row));
+});
+
+adminRouter.put("/compliance/limits", async (req, res) => {
+  const body = z
+    .object({
+      unverifiedNgnDailyCapMinor: z.number().int().nonnegative(),
+      ngnTier1DailyCapMinor: z.number().int().nonnegative(),
+      ngnTier2DailyCapMinor: z.number().int().nonnegative(),
+      cnyDailyCapMinor: z.number().int().nonnegative(),
+      minTierDeposit: z.number().int().min(0).max(3),
+      minTierWithdraw: z.number().int().min(0).max(3),
+      minTierCrossBorder: z.number().int().min(0).max(3),
+      minTierMarketCheckout: z.number().int().min(0).max(3),
+      minTierLogistics: z.number().int().min(0).max(3),
+      allowBasicWhilePending: z.boolean(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid compliance limits");
+
+  const row = await updateComplianceLimits(body.data);
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "compliance.limits.update",
+      entity: "ComplianceLimits",
+      entityId: row.id,
+      meta: body.data,
     },
   });
   return ok(res, serialize(row));
@@ -1572,4 +1656,52 @@ adminRouter.delete("/shipments/:id/documents/:docId", async (req, res) => {
 
 adminRouter.get("/logistics/document-kinds", async (_req, res) => {
   return ok(res, serialize(SHIPMENT_DOCUMENT_KINDS));
+});
+
+adminRouter.get("/records", async (req, res) => {
+  const domain = typeof req.query.domain === "string" ? req.query.domain : "";
+  if (!domain) return fail(res, 400, "VALIDATION", "domain query required");
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  await seedAdminRecords().catch(() => {});
+  const rows = await listAdminRecords(domain, status);
+  return ok(res, serialize(rows));
+});
+
+adminRouter.get("/records/:id", async (req, res) => {
+  await seedAdminRecords().catch(() => {});
+  const row = await getAdminRecord(req.params.id);
+  if (!row) return fail(res, 404, "NOT_FOUND", "Record not found");
+  return ok(res, serialize(row));
+});
+
+adminRouter.post("/records", async (req, res) => {
+  const body = z
+    .object({
+      domain: z.string().min(1),
+      externalId: z.string().optional(),
+      title: z.string().min(1),
+      subtitle: z.string().optional(),
+      status: z.string().optional(),
+      payload: z.record(z.unknown()).optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
+  const row = await createAdminRecord(body.data);
+  return ok(res, serialize(row));
+});
+
+adminRouter.patch("/records/:id", async (req, res) => {
+  const body = z
+    .object({
+      title: z.string().min(1).optional(),
+      subtitle: z.string().optional(),
+      status: z.string().optional(),
+      payload: z.record(z.unknown()).optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
+  const existing = await getAdminRecord(req.params.id);
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Record not found");
+  const row = await patchAdminRecord(req.params.id, body.data);
+  return ok(res, serialize(row));
 });

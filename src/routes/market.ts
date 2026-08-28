@@ -12,6 +12,7 @@ import {
   type VariantAxis,
   type VariantOptions,
 } from "../services/product-variants.js";
+import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
 export const marketRouter = Router();
 
@@ -680,6 +681,7 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
       : `${cart.items.length} items · ${cart.items[0].product.title}`;
 
   try {
+    await assertKycForAction(req.user!.id, "market_checkout");
     const order = await prisma.$transaction(async (tx) => {
       await lockToHold(
         tx,
@@ -809,6 +811,7 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
     });
     return ok(res, serialize(order), 201);
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "CHECKOUT_FAILED", e instanceof Error ? e.message : "Checkout failed");
   }
 });

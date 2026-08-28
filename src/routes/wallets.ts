@@ -12,6 +12,7 @@ import {
 import { getNombaProvider } from "../services/nomba.js";
 import { deliverUserNotification } from "../services/deliver.js";
 import { assertWithinDailyLimit, getWalletLimits } from "../services/limits.js";
+import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
 export const walletsRouter = Router();
 
@@ -98,6 +99,7 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
 
   try {
+    await assertKycForAction(req.user!.id, "deposit");
     await assertWithinDailyLimit(req.user!.id, "deposit", body.data.currency, amountMinor);
     const user = await prisma.user.findUnique({ where: { id: req.user!.id } });
     const result = await prisma.$transaction(async (tx) => {
@@ -146,6 +148,7 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
       201,
     );
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "DEPOSIT_FAILED", e instanceof Error ? e.message : "Deposit failed");
   }
 });
@@ -164,6 +167,7 @@ walletsRouter.post("/withdraw", requireAuth, async (req, res) => {
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
 
   try {
+    await assertKycForAction(req.user!.id, "withdraw");
     await assertWithinDailyLimit(req.user!.id, "withdraw", body.data.currency, amountMinor);
     const result = await prisma.$transaction(async (tx) => {
       await debitWallet(
@@ -214,6 +218,7 @@ walletsRouter.post("/withdraw", requireAuth, async (req, res) => {
     });
     return ok(res, serialize(result), 201);
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "WITHDRAW_FAILED", e instanceof Error ? e.message : "Withdraw failed");
   }
 });
@@ -280,6 +285,7 @@ walletsRouter.post("/fx/convert", requireAuth, async (req, res) => {
   if (!quoteRes) return fail(res, 404, "NO_RATE", "FX rate not found");
 
   try {
+    await assertKycForAction(req.user!.id, "fx_convert");
     const conversion = await prisma.$transaction(async (tx) => {
       await debitWallet(tx, req.user!.id, body.data.from as Currency, fromMinor, `FX sell ${body.data.from}`);
       await creditWallet(tx, req.user!.id, body.data.to as Currency, quoteRes.toMinor, `FX buy ${body.data.to}`);
@@ -317,6 +323,7 @@ walletsRouter.post("/fx/convert", requireAuth, async (req, res) => {
     });
     return ok(res, serialize(conversion), 201);
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "FX_FAILED", e instanceof Error ? e.message : "Convert failed");
   }
 });

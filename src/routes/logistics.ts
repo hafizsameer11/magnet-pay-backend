@@ -12,6 +12,7 @@ import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-code
 import { notifyUserEmail } from "../services/notify.js";
 import { estimateQuoteMinor } from "../services/freight-pricing.js";
 import { advanceShipmentOps, settleShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
+import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
 export const logisticsRouter = Router();
 
@@ -133,6 +134,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
   if (quote.validUntil < new Date()) return fail(res, 400, "EXPIRED", "Quote expired");
 
   try {
+    await assertKycForAction(req.user!.id, "logistics_book");
     const shipment = await prisma.$transaction(async (tx) => {
       await lockToHold(
         tx,
@@ -231,6 +233,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
     }
     return ok(res, serialize(shipment), 201);
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "BOOK_FAILED", e instanceof Error ? e.message : "Book failed");
   }
 });

@@ -7,6 +7,7 @@ import { getNombaProvider } from "../services/nomba.js";
 import { assertRecipientVerified, verifyRecipientById } from "../services/recipient-verify.js";
 import { deliverUserNotification } from "../services/deliver.js";
 import { assertWithinDailyLimit } from "../services/limits.js";
+import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
 export const recipientsRouter = Router();
 export const transfersRouter = Router();
@@ -118,6 +119,9 @@ transfersRouter.post("/", requireAuth, async (req, res) => {
   const totalDebitMinor = amountMinor + fxFeeMinor + networkFeeMinor;
 
   try {
+    if (body.data.currency === "CNY") {
+      await assertKycForAction(req.user!.id, "send");
+    }
     await assertWithinDailyLimit(req.user!.id, "send", body.data.currency, amountMinor);
     const transfer = await prisma.$transaction(async (tx) => {
       const wallet = await tx.wallet.findUnique({
@@ -209,6 +213,7 @@ transfersRouter.post("/", requireAuth, async (req, res) => {
     });
     return ok(res, serialize(transfer), 201);
   } catch (e) {
+    if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
     return fail(res, 400, "TRANSFER_FAILED", e instanceof Error ? e.message : "Transfer failed");
   }
 });
