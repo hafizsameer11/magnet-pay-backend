@@ -13,6 +13,7 @@ import {
   type VariantOptions,
 } from "../services/product-variants.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
+import { advanceShipmentOps } from "../services/shipment-ops.js";
 
 export const marketRouter = Router();
 
@@ -471,6 +472,22 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
         .join(" · ") || title,
     },
   });
+  if (body.data.status === "SHIPPED" && updated.shipmentId) {
+    try {
+      const linked = await prisma.shipment.findUnique({ where: { id: updated.shipmentId } });
+      if (linked?.status === "HOLD_LOCKED") {
+        await advanceShipmentOps({
+          shipmentId: linked.id,
+          status: "IN_TRANSIT",
+          message: `Seller marked shipped${body.data.tracking || updated.tracking ? ` · ${body.data.tracking || updated.tracking}` : ""}`,
+          skipSellerShipCheck: true,
+          actor: "admin",
+        });
+      }
+    } catch {
+      // Shipment advance is best-effort; order status is already saved.
+    }
+  }
   return ok(res, serialize(updated));
 });
 

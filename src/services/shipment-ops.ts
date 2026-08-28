@@ -21,6 +21,10 @@ export const SHIPMENT_NEXT: Partial<
   READY_FOR_POD: "DELIVERED",
 };
 
+export type ShipmentActor = "buyer" | "admin";
+
+export const SHIPMENT_BUYER_TARGETS = ["DELIVERED"] as const;
+
 export const SHIPMENT_ADVANCE_TARGETS = [
   "IN_TRANSIT",
   "CUSTOMS",
@@ -55,6 +59,7 @@ export async function attachShipmentDocument(input: {
   name: string;
   url: string;
   eventMessage?: string;
+  allowPod?: boolean;
 }) {
   const shipment = await prisma.shipment.findFirst({
     where: {
@@ -63,6 +68,10 @@ export async function attachShipmentDocument(input: {
     },
   });
   if (!shipment) throw new Error("Shipment not found");
+
+  if (input.kind.startsWith("pod_") && !input.allowPod && shipment.status !== "READY_FOR_POD") {
+    throw new Error("Proof of delivery can only be submitted when the shipment is ready for delivery confirmation");
+  }
 
   const doc = await prisma.$transaction(async (tx) => {
     const row = await tx.shipmentDocument.create({
@@ -124,13 +133,17 @@ export async function advanceShipmentOps(input: {
   status?: (typeof SHIPMENT_ADVANCE_TARGETS)[number];
   message?: string;
   skipPodCheck?: boolean;
+  skipSellerShipCheck?: boolean;
   notify?: boolean;
+  actor?: ShipmentActor;
 }) {
+  const actor = input.actor ?? "admin";
   const shipment = await prisma.shipment.findFirst({
     where: {
       id: input.shipmentId,
       ...(input.userId ? { userId: input.userId } : {}),
     },
+    include: { marketOrder: { select: { id: true, status: true } } },
   });
   if (!shipment) {
     throw new Error("Shipment not found");
@@ -139,6 +152,24 @@ export async function advanceShipmentOps(input: {
   const status = input.status ?? SHIPMENT_NEXT[shipment.status];
   if (!status) {
     throw new Error(`Cannot advance from ${shipment.status}`);
+  }
+
+  if (actor === "buyer") {
+    if (status !== "DELIVERED") {
+      throw new Error("Shipment progress is updated by MagnetPay logistics — you can only confirm delivery");
+    }
+    if (shipment.status !== "READY_FOR_POD") {
+      throw new Error("Shipment is not ready for proof of delivery yet");
+    }
+  }
+
+  if (
+    status === "IN_TRANSIT" &&
+    !input.skipSellerShipCheck &&
+    shipment.marketOrder &&
+    !["SHIPPED", "DELIVERED", "COMPLETED"].includes(shipment.marketOrder.status)
+  ) {
+    throw new Error("Seller must mark the order as shipped before cargo can move in transit");
   }
 
   if (status === "DELIVERED" && !input.skipPodCheck) {

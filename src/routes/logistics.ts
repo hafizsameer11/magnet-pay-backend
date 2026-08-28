@@ -11,7 +11,7 @@ import {
 import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-codes.js";
 import { notifyUserEmail } from "../services/notify.js";
 import { estimateQuoteMinor } from "../services/freight-pricing.js";
-import { advanceShipmentOps, settleShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
+import { advanceShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
 export const logisticsRouter = Router();
@@ -278,42 +278,20 @@ logisticsRouter.post("/shipments/:id/advance", requireAuth, async (req, res) => 
       userId: req.user!.id,
       status: body.data.status,
       message: body.data.message,
+      actor: "buyer",
     });
     return ok(res, serialize(updated));
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Advance failed";
     if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
     if (msg.includes("proof-of-delivery")) return fail(res, 400, "POD_REQUIRED", msg);
+    if (msg.includes("logistics") || msg.includes("not ready")) return fail(res, 400, "BAD_STATE", msg);
     return fail(res, 400, "BAD_STATE", msg);
   }
 });
 
-logisticsRouter.post("/shipments/:id/settle", requireAuth, async (req, res) => {
-  const body = z
-    .object({
-      finalMinor: z.union([z.string(), z.number()]).optional(),
-      breakdown: z
-        .array(z.object({ label: z.string().min(1), amountMinor: z.number().int().positive() }))
-        .optional(),
-      notes: z.string().optional(),
-    })
-    .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid settle payload");
-  try {
-    const result = await settleShipmentOps({
-      shipmentId: req.params.id,
-      userId: req.user!.id,
-      finalMinor: body.data.finalMinor != null ? BigInt(body.data.finalMinor) : undefined,
-      breakdown: body.data.breakdown,
-      notes: body.data.notes,
-    });
-    return ok(res, serialize(result));
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Settle failed";
-    if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
-    if (msg.includes("Already settled")) return fail(res, 400, "ALREADY_SETTLED", msg);
-    return fail(res, 400, "SETTLE_FAILED", msg);
-  }
+logisticsRouter.post("/shipments/:id/settle", requireAuth, async (_req, res) => {
+  return fail(res, 403, "FORBIDDEN", "Customs settlement is handled by MagnetPay logistics");
 });
 
 logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
@@ -432,6 +410,7 @@ logisticsRouter.post("/shipments/:id/documents", requireAuth, async (req, res) =
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Upload failed";
     if (msg.includes("not found")) return fail(res, 404, "NOT_FOUND", msg);
+    if (msg.includes("Proof of delivery")) return fail(res, 400, "BAD_STATE", msg);
     return fail(res, 400, "UPLOAD_FAILED", msg);
   }
 });
