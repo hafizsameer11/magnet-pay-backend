@@ -193,6 +193,9 @@ model User {
   escrowsAsSeller Escrow[]        @relation("EscrowSeller")
   escrowInvites   EscrowInvite[]  @relation("InviteAccepter")
   disputes        Dispute[]       @relation("DisputeOpener")
+  disputesAssigned Dispute[]      @relation("DisputeAssignee")
+  orderNotes      OrderNote[]     @relation("OrderNoteAuthor")
+  productViews    ProductView[]
   quoteRequests   ShippingQuoteRequest[]
   shipments       Shipment[]
   shipmentClaims  ShipmentClaim[]
@@ -478,40 +481,79 @@ model SellerStore {
   teamInvites SellerTeamInvite[]
 }
 
+enum ProductModerationStatus {
+  ACTIVE
+  PENDING
+  REPORTED
+  HIDDEN
+  REJECTED
+}
+
+model Brand {
+  id        String    @id @default(uuid())
+  name      String
+  status    String    @default("verified")
+  country   String    @default("CN")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+
+  @@index([name])
+}
+
 model Product {
-  id          String         @id @default(uuid())
-  storeId     String
-  categoryId  String?
-  title       String
-  description String?        @db.Text
-  priceMinor  BigInt
-  currency    Currency       @default(USD)
-  imageUrl    String?
-  moq         String         @default("1 unit")
-  rating      Float          @default(4.5)
-  stock       Int?
-  variantAxes Json?
-  pricingTiers Json?
-  cbmPerUnit       Float?
-  weightKgPerUnit  Float?
-  originHub        String?
-  leadTimeMin      Int?
-  leadTimeMax      Int?
-  packagingType    String?
-  defaultIncoterm  String?        @default("FOB")
-  active      Boolean        @default(true)
-  createdAt   DateTime       @default(now())
-  store       SellerStore    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  category    Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  media       ProductMedia[]
-  variants    ProductVariant[]
-  cartItems   CartItem[]
-  orderItems  OrderItem[]
-  wishlist    WishlistItem[]
-  reviews     Review[]
+  id                 String                  @id @default(uuid())
+  storeId            String
+  categoryId         String?
+  brandId            String?
+  title              String
+  description        String?                 @db.Text
+  priceMinor         BigInt
+  currency           Currency                @default(USD)
+  imageUrl           String?
+  moq                String                  @default("1 unit")
+  rating             Float                   @default(4.5)
+  stock              Int?
+  variantAxes        Json?
+  pricingTiers       Json?
+  cbmPerUnit         Float?
+  weightKgPerUnit    Float?
+  originHub          String?
+  leadTimeMin        Int?
+  leadTimeMax        Int?
+  packagingType      String?
+  defaultIncoterm    String?                 @default("FOB")
+  active             Boolean                 @default(true)
+  moderationStatus   ProductModerationStatus @default(ACTIVE)
+  flagReason         String?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  store              SellerStore             @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  category           Category?               @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  brand              Brand?                  @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  media              ProductMedia[]
+  variants           ProductVariant[]
+  cartItems          CartItem[]
+  orderItems         OrderItem[]
+  wishlist           WishlistItem[]
+  reviews            Review[]
+  views              ProductView[]
 
   @@index([storeId])
   @@index([categoryId])
+  @@index([brandId])
+}
+
+model ProductView {
+  id        String   @id @default(uuid())
+  productId String
+  userId    String?
+  createdAt DateTime @default(now())
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([productId, createdAt])
+  @@index([userId])
 }
 
 model ProductVariant {
@@ -584,9 +626,23 @@ model MarketOrder {
   shipment    Shipment?   @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
   items       OrderItem[]
   quoteRequests ShippingQuoteRequest[]
+  notes       OrderNote[]
 
   @@index([userId])
   @@index([shipmentId])
+}
+
+model OrderNote {
+  id        String      @id @default(uuid())
+  orderId   String
+  authorId  String
+  body      String      @db.Text
+  createdAt DateTime    @default(now())
+  order     MarketOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  author    User        @relation("OrderNoteAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([authorId])
 }
 
 model OrderItem {
@@ -740,15 +796,21 @@ model Dispute {
   id          String   @id @default(uuid())
   escrowId    String
   openedById  String
+  assigneeId  String?
   reason      String
+  status      String   @default("OPEN")
+  priority    String   @default("normal")
   evidence    Json?
   outcome     String?
+  ruling      String?  @db.Text
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   escrow      Escrow   @relation(fields: [escrowId], references: [id], onDelete: Cascade)
   openedBy    User     @relation("DisputeOpener", fields: [openedById], references: [id], onDelete: Cascade)
+  assignee    User?    @relation("DisputeAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
 
   @@index([escrowId])
+  @@index([status])
 }
 
 model ShippingQuoteRequest {

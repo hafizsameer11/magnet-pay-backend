@@ -25,6 +25,7 @@ import {
   patchAdminRecord,
 } from "../services/admin-records.js";
 import { seedAdminRecords } from "../services/admin-records-seed.js";
+import { registerAdminExtensions } from "./admin-extensions.js";
 
 export const notificationsRouter = Router();
 export const messagesRouter = Router();
@@ -932,6 +933,7 @@ adminRouter.get("/products/:id", async (req, res) => {
     include: {
       store: { include: { user: { select: userSelect } } },
       category: true,
+      brand: true,
       media: { orderBy: { sortOrder: "asc" } },
       variants: { orderBy: { createdAt: "asc" } },
       reviews: {
@@ -961,16 +963,25 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
   const existing = await prisma.product.findUnique({ where: { id: req.params.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
 
-  // Product has `active` boolean only — map moderation statuses
+  // Product has `active` boolean — map moderation statuses
   let active = existing.active;
+  let moderationStatus = existing.moderationStatus;
   if (body.data.active !== undefined) active = body.data.active;
-  else if (body.data.status === "APPROVED") active = true;
-  else if (body.data.status === "HIDDEN" || body.data.status === "REJECTED") active = false;
+  else if (body.data.status === "APPROVED") {
+    active = true;
+    moderationStatus = "ACTIVE";
+  } else if (body.data.status === "HIDDEN") {
+    active = false;
+    moderationStatus = "HIDDEN";
+  } else if (body.data.status === "REJECTED") {
+    active = false;
+    moderationStatus = "REJECTED";
+  }
 
   const row = await prisma.product.update({
     where: { id: req.params.id },
-    data: { active },
-    include: { store: true, category: true },
+    data: { active, moderationStatus },
+    include: { store: true, category: true, brand: true },
   });
   await prisma.auditLog.create({
     data: {
@@ -1261,29 +1272,8 @@ adminRouter.post("/announcements", async (req, res) => {
 });
 
 adminRouter.get("/analytics/overview", async (_req, res) => {
-  const [users, walletAgg, transfers, escrows, orders, shipments] = await Promise.all([
-    prisma.user.count(),
-    prisma.wallet.aggregate({ _sum: { balanceMinor: true, holdMinor: true } }),
-    prisma.transfer.count(),
-    prisma.escrow.count(),
-    prisma.marketOrder.count(),
-    prisma.shipment.count(),
-  ]);
-
-  return ok(
-    res,
-    serialize({
-      users,
-      wallets: {
-        balanceMinorSum: walletAgg._sum.balanceMinor ?? 0n,
-        holdMinorSum: walletAgg._sum.holdMinor ?? 0n,
-      },
-      transfers,
-      escrows,
-      orders,
-      shipments,
-    }),
-  );
+  const { getAdminAnalyticsOverview } = await import("../services/admin-analytics.js");
+  return ok(res, serialize(await getAdminAnalyticsOverview()));
 });
 
 adminRouter.post("/push/test", requireAdmin, async (req, res) => {
@@ -1803,3 +1793,5 @@ adminRouter.patch("/records/:id", async (req, res) => {
   const row = await patchAdminRecord(req.params.id, body.data);
   return ok(res, serialize(row));
 });
+
+registerAdminExtensions(adminRouter);
