@@ -28,11 +28,17 @@ const productShippingSchema = {
 };
 
 function orderLogisticsNextAction(order: {
+  status: string;
   logisticsStatus: string;
   shipment?: { id: string; ref: string; status: string } | null;
 }): string {
   if (order.shipment?.status === "TOP_UP_REQUIRED") return "TOP_UP_REQUIRED";
-  if (order.shipment?.status === "READY_FOR_POD") return "CONFIRM_POD";
+  if (
+    order.shipment?.status === "READY_FOR_POD" &&
+    ["SHIPPED", "DELIVERED", "COMPLETED"].includes(order.status)
+  ) {
+    return "CONFIRM_POD";
+  }
   if (order.shipment) return "TRACK_SHIPMENT";
   if (order.logisticsStatus === "QUOTE_PENDING") return "COMPLETE_BOOKING";
   return "BOOK_FREIGHT";

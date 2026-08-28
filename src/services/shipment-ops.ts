@@ -52,6 +52,28 @@ function breakdownSummary(lines: ShipmentCostLine[]) {
   return lines.map((l) => `${l.label}: ₦${(l.amountMinor / 100).toLocaleString()}`).join(" · ");
 }
 
+type ShipmentWithOrder = {
+  marketOrder?: { id: string; status: string } | null;
+};
+
+function requireSellerShippedForMarketOrder(shipment: ShipmentWithOrder, action: string) {
+  if (!shipment.marketOrder) return;
+  if (!["SHIPPED", "DELIVERED", "COMPLETED"].includes(shipment.marketOrder.status)) {
+    throw new Error(`Seller must mark the order as shipped before ${action}`);
+  }
+}
+
+function assertValidShipmentTransition(current: ShipmentStatus, target: ShipmentStatus) {
+  const expected = SHIPMENT_NEXT[current];
+  if (!expected || expected !== target) {
+    throw new Error(
+      expected
+        ? `Invalid status change: from ${current.replace(/_/g, " ")} you can only move to ${expected.replace(/_/g, " ")}`
+        : `Cannot advance from ${current.replace(/_/g, " ")}`,
+    );
+  }
+}
+
 export async function attachShipmentDocument(input: {
   shipmentId: string;
   userId?: string;
@@ -66,11 +88,15 @@ export async function attachShipmentDocument(input: {
       id: input.shipmentId,
       ...(input.userId ? { userId: input.userId } : {}),
     },
+    include: { marketOrder: { select: { id: true, status: true } } },
   });
   if (!shipment) throw new Error("Shipment not found");
 
-  if (input.kind.startsWith("pod_") && !input.allowPod && shipment.status !== "READY_FOR_POD") {
-    throw new Error("Proof of delivery can only be submitted when the shipment is ready for delivery confirmation");
+  if (input.kind.startsWith("pod_") && !input.allowPod) {
+    if (shipment.status !== "READY_FOR_POD") {
+      throw new Error("Proof of delivery can only be submitted when the shipment is ready for delivery confirmation");
+    }
+    requireSellerShippedForMarketOrder(shipment, "confirming delivery");
   }
 
   const doc = await prisma.$transaction(async (tx) => {
@@ -161,15 +187,16 @@ export async function advanceShipmentOps(input: {
     if (shipment.status !== "READY_FOR_POD") {
       throw new Error("Shipment is not ready for proof of delivery yet");
     }
+    requireSellerShippedForMarketOrder(shipment, "confirming delivery");
   }
 
-  if (
-    status === "IN_TRANSIT" &&
-    !input.skipSellerShipCheck &&
-    shipment.marketOrder &&
-    !["SHIPPED", "DELIVERED", "COMPLETED"].includes(shipment.marketOrder.status)
-  ) {
-    throw new Error("Seller must mark the order as shipped before cargo can move in transit");
+  assertValidShipmentTransition(shipment.status, status);
+
+  if (status !== "IN_TRANSIT" || !input.skipSellerShipCheck) {
+    requireSellerShippedForMarketOrder(
+      shipment,
+      status === "IN_TRANSIT" ? "cargo can move in transit" : status.replace(/_/g, " ").toLowerCase(),
+    );
   }
 
   if (status === "DELIVERED" && !input.skipPodCheck) {
@@ -227,7 +254,7 @@ export async function settleShipmentOps(input: {
       id: input.shipmentId,
       ...(input.userId ? { userId: input.userId } : {}),
     },
-    include: { hold: true, settlement: true },
+    include: { hold: true, settlement: true, marketOrder: { select: { id: true, status: true } } },
   });
   if (!shipment?.hold) {
     throw new Error("Shipment/hold not found");
@@ -235,6 +262,7 @@ export async function settleShipmentOps(input: {
   if (shipment.settlement) {
     throw new Error("Already settled");
   }
+  requireSellerShippedForMarketOrder(shipment, "customs settlement");
 
   let finalMinor = input.finalMinor;
   const breakdown = input.breakdown?.filter((l) => l.label.trim() && l.amountMinor > 0) ?? [];
