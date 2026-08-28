@@ -1,5 +1,4 @@
 import express from "express";
-import cors from "cors";
 import { env } from "./lib/prisma.js";
 import { authRouter } from "./routes/auth.js";
 import { meRouter } from "./routes/me.js";
@@ -19,7 +18,26 @@ const SEED_MEDIA_DIR = path.resolve(__dirname, "../seed-media");
 
 export function createApp() {
   const app = express();
-  app.use(cors({ origin: env("CORS_ORIGIN", "*") === "*" ? true : env("CORS_ORIGIN") }));
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    } else {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    }
+    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      req.headers["access-control-request-headers"] ?? "Content-Type, Authorization",
+    );
+    res.setHeader("Access-Control-Max-Age", "86400");
+    if (req.method === "OPTIONS") {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
   app.use(express.json({ limit: env("JSON_BODY_LIMIT", "12mb") }));
 
   app.get("/health", (_req, res) => {

@@ -150,7 +150,26 @@ async function syncOrderLogisticsFromShipment(tx: TxClient, shipmentId: string, 
   ) {
     logisticsStatus = "IN_TRANSIT";
   }
-  await tx.marketOrder.update({ where: { id: order.id }, data: { logisticsStatus } });
+
+  const orderPatch: { logisticsStatus: typeof logisticsStatus; status?: "DELIVERED" } = { logisticsStatus };
+  if (shipmentStatus === "DELIVERED" && order.status === "SHIPPED") {
+    orderPatch.status = "DELIVERED";
+  }
+  await tx.marketOrder.update({ where: { id: order.id }, data: orderPatch });
+
+  if (shipmentStatus === "DELIVERED" && order.escrowId) {
+    await tx.escrowMilestone.updateMany({
+      where: { escrowId: order.escrowId, status: "FUNDED", releaseRequestedAt: null },
+      data: { releaseRequestedAt: new Date() },
+    });
+    await tx.notification.create({
+      data: {
+        userId: order.userId,
+        title: "Delivery confirmed",
+        body: "You confirmed receipt. You can now release escrow funds when ready.",
+      },
+    });
+  }
 }
 
 export async function advanceShipmentOps(input: {
@@ -188,6 +207,8 @@ export async function advanceShipmentOps(input: {
       throw new Error("Shipment is not ready for proof of delivery yet");
     }
     requireSellerShippedForMarketOrder(shipment, "confirming delivery");
+  } else if (status === "DELIVERED") {
+    throw new Error("Only the buyer can confirm proof of delivery");
   }
 
   assertValidShipmentTransition(shipment.status, status);

@@ -24,7 +24,13 @@ export function releaseGate(input: {
         waitReason: "Waiting for the seller to mark this order as shipped.",
       };
     }
-    if (input.orderStatus === "SHIPPED" || input.orderStatus === "DELIVERED") {
+    if (input.orderStatus === "SHIPPED") {
+      return {
+        canRelease: false,
+        waitReason: "Confirm proof of delivery before releasing funds.",
+      };
+    }
+    if (input.orderStatus === "DELIVERED" || input.orderStatus === "COMPLETED") {
       return { canRelease: true, waitReason: null };
     }
     return { canRelease: false, waitReason: `Cannot release while order is ${input.orderStatus}.` };
@@ -32,7 +38,7 @@ export function releaseGate(input: {
   if (!input.releaseRequestedAt) {
     return {
       canRelease: false,
-      waitReason: "Waiting for the seller to confirm shipped/delivered and request release.",
+      waitReason: "Waiting for the buyer to confirm delivery (proof of delivery).",
     };
   }
   return { canRelease: true, waitReason: null };

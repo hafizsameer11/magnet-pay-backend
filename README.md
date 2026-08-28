@@ -48,7 +48,6 @@ Copy `.env.example` → `.env`.
 | `DATABASE_URL` | MySQL connection string |
 | `JWT_SECRET` / `JWT_REFRESH_SECRET` | Auth tokens — use strong random values in production |
 | `PORT` | Default `4000` |
-| `CORS_ORIGIN` | `*` for dev, or your app origins in prod |
 | `NOMBA_MODE` | `mock` (default) or live when wired |
 | `API_PUBLIC_URL` | Public base URL for seed asset links, e.g. `https://api.yourdomain.com` |
 | `SMTP_*` / `EMAIL_FROM` | Hostinger (or other) SMTP for OTP + transactional email |
@@ -116,7 +115,6 @@ Point `https://api.yourdomain.com` → `127.0.0.1:4000`. Set:
 
 ```
 API_PUBLIC_URL=https://api.yourdomain.com
-CORS_ORIGIN=https://your-admin-domain.com
 ```
 
 ### 5. Mobile / admin clients

@@ -845,6 +845,75 @@ adminRouter.post("/orders/:id/cancel", async (req, res) => {
   return ok(res, serialize(row));
 });
 
+/** Admin marks marketplace order shipped (e.g. when seller has not updated the app). */
+adminRouter.post("/orders/:id/mark-shipped", async (req, res) => {
+  const body = z
+    .object({
+      tracking: z.string().optional(),
+      carrier: z.string().optional(),
+      note: z.string().optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid payload");
+
+  const order = await prisma.marketOrder.findUnique({ where: { id: req.params.id } });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (!["IN_ESCROW", "SHIPPED"].includes(order.status)) {
+    return fail(res, 400, "BAD_STATUS", `Cannot mark shipped from ${order.status}`);
+  }
+
+  const tracking = body.data.tracking?.trim() || order.tracking || `ADMIN-${order.id.slice(0, 8)}`;
+  const updated = await prisma.marketOrder.update({
+    where: { id: order.id },
+    data: {
+      status: "SHIPPED",
+      tracking,
+      ...(body.data.carrier !== undefined ? { carrier: body.data.carrier || null } : {}),
+      ...(body.data.note?.trim()
+        ? { sellerNote: order.sellerNote ? `${order.sellerNote}\n[Admin] ${body.data.note}` : `[Admin] ${body.data.note}` }
+        : {}),
+    },
+    include: { items: true, user: { select: userSelect } },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "order.mark_shipped",
+      entity: "MarketOrder",
+      entityId: order.id,
+      meta: { tracking, previousStatus: order.status },
+    },
+  });
+
+  await prisma.notification.create({
+    data: {
+      userId: order.userId,
+      title: "Order marked as shipped",
+      body: `MagnetPay ops marked your order shipped · Tracking: ${tracking}`,
+    },
+  });
+
+  if (updated.shipmentId) {
+    try {
+      const linked = await prisma.shipment.findUnique({ where: { id: updated.shipmentId } });
+      if (linked?.status === "HOLD_LOCKED") {
+        await advanceShipmentOps({
+          shipmentId: linked.id,
+          status: "IN_TRANSIT",
+          message: `Admin marked order shipped · ${tracking}`,
+          skipSellerShipCheck: true,
+          actor: "admin",
+        });
+      }
+    } catch {
+      /* shipment advance optional if already moved */
+    }
+  }
+
+  return ok(res, serialize(updated));
+});
+
 adminRouter.get("/products", async (_req, res) => {
   const rows = await prisma.product.findMany({
     include: {
@@ -855,6 +924,26 @@ adminRouter.get("/products", async (_req, res) => {
     take: 200,
   });
   return ok(res, serialize(rows));
+});
+
+adminRouter.get("/products/:id", async (req, res) => {
+  const row = await prisma.product.findUnique({
+    where: { id: req.params.id },
+    include: {
+      store: { include: { user: { select: userSelect } } },
+      category: true,
+      media: { orderBy: { sortOrder: "asc" } },
+      variants: { orderBy: { createdAt: "asc" } },
+      reviews: {
+        orderBy: { createdAt: "desc" },
+        take: 10,
+        include: { user: { select: userSelect } },
+      },
+      _count: { select: { orderItems: true, reviews: true } },
+    },
+  });
+  if (!row) return fail(res, 404, "NOT_FOUND", "Product not found");
+  return ok(res, serialize(row));
 });
 
 adminRouter.post("/products/:id/moderate", async (req, res) => {
@@ -1059,7 +1148,11 @@ adminRouter.get("/shipments/:id", async (req, res) => {
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Shipment not found");
-  return ok(res, serialize(row));
+  const marketOrder = await prisma.marketOrder.findFirst({
+    where: { shipmentId: row.id },
+    select: { id: true, status: true, tracking: true, supplier: true, escrowId: true },
+  });
+  return ok(res, serialize({ ...row, marketOrder }));
 });
 
 adminRouter.get("/fx/rates", async (_req, res) => {
@@ -1516,9 +1609,9 @@ adminRouter.get("/logistics/shipment-flow", async (_req, res) => {
 adminRouter.post("/shipments/:id/advance", async (req, res) => {
   const body = z
     .object({
-      status: z.enum(["IN_TRANSIT", "CUSTOMS", "SETTLEMENT_PENDING", "READY_FOR_POD", "DELIVERED"]).optional(),
+      status: z.enum(["IN_TRANSIT", "CUSTOMS", "SETTLEMENT_PENDING", "READY_FOR_POD"]).optional(),
       message: z.string().optional(),
-      skipPodCheck: z.boolean().optional(),
+      skipSellerShipCheck: z.boolean().optional(),
     })
     .safeParse(req.body ?? {});
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid advance payload");
@@ -1528,7 +1621,9 @@ adminRouter.post("/shipments/:id/advance", async (req, res) => {
       shipmentId: req.params.id,
       status: body.data.status,
       message: body.data.message,
-      skipPodCheck: body.data.skipPodCheck ?? true,
+      skipPodCheck: true,
+      skipSellerShipCheck: body.data.skipSellerShipCheck === true,
+      actor: "admin",
     });
     await prisma.auditLog.create({
       data: {
@@ -1608,6 +1703,9 @@ adminRouter.post("/shipments/:id/documents", async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
+  if (body.data.kind.startsWith("pod_")) {
+    return fail(res, 403, "FORBIDDEN", "Proof of delivery can only be submitted by the buyer");
+  }
 
   try {
     const doc = await attachShipmentDocument({
@@ -1655,7 +1753,7 @@ adminRouter.delete("/shipments/:id/documents/:docId", async (req, res) => {
 });
 
 adminRouter.get("/logistics/document-kinds", async (_req, res) => {
-  return ok(res, serialize(SHIPMENT_DOCUMENT_KINDS));
+  return ok(res, serialize(SHIPMENT_DOCUMENT_KINDS.filter((k) => !k.startsWith("pod_"))));
 });
 
 adminRouter.get("/records", async (req, res) => {

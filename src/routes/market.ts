@@ -14,6 +14,11 @@ import {
 } from "../services/product-variants.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 import { advanceShipmentOps } from "../services/shipment-ops.js";
+import {
+  orderDocumentsForBuyer,
+  orderDocumentsForSeller,
+  REQUIRED_SELLER_DOC_KINDS,
+} from "../services/order-docs.js";
 
 export const marketRouter = Router();
 
@@ -32,6 +37,7 @@ function orderLogisticsNextAction(order: {
   logisticsStatus: string;
   shipment?: { id: string; ref: string; status: string } | null;
 }): string {
+  if (order.status === "DELIVERED") return "RELEASE_ESCROW";
   if (order.shipment?.status === "TOP_UP_REQUIRED") return "TOP_UP_REQUIRED";
   if (
     order.shipment?.status === "READY_FOR_POD" &&
@@ -410,7 +416,7 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const body = z
     .object({
-      status: z.enum(["IN_ESCROW", "SHIPPED", "DELIVERED", "DISPUTED", "CANCELLED"]).optional(),
+      status: z.enum(["IN_ESCROW", "SHIPPED", "DISPUTED", "CANCELLED"]).optional(),
       tracking: z.string().optional(),
       carrier: z.string().optional(),
       note: z.string().optional(),
@@ -435,8 +441,13 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
   if (body.data.status === "SHIPPED" && !["IN_ESCROW", "SHIPPED"].includes(order.status)) {
     return fail(res, 400, "BAD_STATUS", `Cannot mark shipped from ${order.status}`);
   }
-  if (body.data.status === "DELIVERED" && !["SHIPPED", "DELIVERED"].includes(order.status)) {
-    return fail(res, 400, "BAD_STATUS", "Mark shipped before marking delivered");
+  if (body.data.status === "DELIVERED") {
+    return fail(
+      res,
+      403,
+      "FORBIDDEN",
+      "Sellers cannot mark delivered — the buyer confirms receipt via proof of delivery",
+    );
   }
   const updated = await prisma.marketOrder.update({
     where: { id: order.id },
@@ -452,18 +463,10 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
     },
     include: { items: true, user: { select: { id: true, name: true, phone: true } } },
   });
-  if (order.escrowId && (body.data.status === "SHIPPED" || body.data.status === "DELIVERED")) {
-    await prisma.escrowMilestone.updateMany({
-      where: { escrowId: order.escrowId, status: "FUNDED", releaseRequestedAt: null },
-      data: { releaseRequestedAt: new Date() },
-    });
-  }
   const title =
     body.data.status === "SHIPPED"
       ? "Seller marked order as shipped"
-      : body.data.status === "DELIVERED"
-        ? "Seller marked order as delivered"
-        : "Order update";
+      : "Order update";
   await prisma.notification.create({
     data: {
       userId: order.userId,
@@ -554,9 +557,8 @@ marketRouter.get("/seller/orders/:id/documents", requireAuth, async (req, res) =
     where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
-  const meta = await sellerMeta(req.user!.id);
-  const all = (meta.orderDocs as Record<string, unknown[]>) ?? {};
-  return ok(res, all[order.id] ?? []);
+  const payload = await orderDocumentsForSeller(req.user!.id, order.id);
+  return ok(res, serialize(payload));
 });
 
 marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) => {
@@ -577,6 +579,45 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) 
     data: { userId: order.userId, title: "New shipping document", body: `${body.data.name} · order ${order.id.slice(0, 8)}` },
   });
   return ok(res, list[list.length - 1], 201);
+});
+
+marketRouter.post("/seller/orders/:id/documents/send", requireAuth, async (req, res) => {
+  const store = await sellerStoreFor(req.user!.id);
+  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    include: { user: { select: { id: true, name: true } } },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+
+  const { documents } = await orderDocumentsForSeller(req.user!.id, order.id);
+  const uploadedKinds = new Set(documents.map((d) => d.kind));
+  const missing = REQUIRED_SELLER_DOC_KINDS.filter((k) => !uploadedKinds.has(k));
+  if (missing.length) {
+    return fail(res, 400, "DOCS_INCOMPLETE", `Upload required docs first: ${missing.join(", ")}`);
+  }
+
+  const sentAt = new Date().toISOString();
+  const meta = await sellerMeta(req.user!.id);
+  const sentMap = { ...((meta.orderDocPackageSent as Record<string, string>) ?? {}), [order.id]: sentAt };
+  await saveSellerMeta(req.user!.id, { orderDocPackageSent: sentMap });
+
+  const docList = documents.map((d) => d.name).join(", ");
+  await prisma.notification.create({
+    data: {
+      userId: order.userId,
+      title: "Shipping doc package ready",
+      body: `${store.name} sent ${documents.length} documents for order ${order.id.slice(0, 8)}: ${docList}`,
+    },
+  });
+
+  return ok(
+    res,
+    serialize({
+      sentAt,
+      documents,
+    }),
+  );
 });
 
 /* ─── Cart ─────────────────────────────────────────────────────────── */
@@ -874,13 +915,8 @@ marketRouter.get("/orders/:id/documents", requireAuth, async (req, res) => {
     where: { id: req.params.id, userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
-  const store = await prisma.sellerStore.findFirst({
-    where: { OR: [{ id: order.supplier }, { name: order.supplier }] },
-  });
-  if (!store) return ok(res, []);
-  const meta = await sellerMeta(store.userId);
-  const all = (meta.orderDocs as Record<string, unknown[]>) ?? {};
-  return ok(res, all[order.id] ?? []);
+  const payload = await orderDocumentsForBuyer(order.id);
+  return ok(res, serialize(payload));
 });
 
 marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
@@ -937,18 +973,61 @@ marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
   return ok(res, serialize(rebuilt));
 });
 
+/** Buyer confirms receipt. With a linked shipment, POD must complete first. Without shipment, this marks the order delivered. */
+marketRouter.post("/orders/:id/confirm-delivery", requireAuth, async (req, res) => {
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: req.params.id, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (order.status === "DELIVERED" || order.status === "COMPLETED") {
+    return ok(res, serialize(order));
+  }
+  if (order.status !== "SHIPPED") {
+    return fail(res, 400, "BAD_STATUS", "Order must be shipped before confirming delivery");
+  }
+  if (order.shipmentId) {
+    const shipment = await prisma.shipment.findUnique({ where: { id: order.shipmentId } });
+    if (shipment?.status !== "DELIVERED") {
+      return fail(
+        res,
+        400,
+        "POD_REQUIRED",
+        "Complete proof of delivery on your shipment before confirming receipt",
+      );
+    }
+    return ok(res, serialize(order));
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const row = await tx.marketOrder.update({
+      where: { id: order.id },
+      data: { status: "DELIVERED", logisticsStatus: "DELIVERED" },
+    });
+    if (order.escrowId) {
+      await tx.escrowMilestone.updateMany({
+        where: { escrowId: order.escrowId, status: "FUNDED", releaseRequestedAt: null },
+        data: { releaseRequestedAt: new Date() },
+      });
+    }
+    return row;
+  });
+  return ok(res, serialize(updated));
+});
+
 marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
     where: { id: req.params.id, userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (order.status === "COMPLETED") return ok(res, serialize(order));
-  if (!["SHIPPED", "DELIVERED"].includes(order.status)) {
+  if (!["DELIVERED", "COMPLETED"].includes(order.status)) {
     return fail(
       res,
       400,
       "NOT_READY",
-      "Seller must mark this order as shipped (or delivered) before you can release funds",
+      order.status === "SHIPPED"
+        ? "Confirm proof of delivery before releasing funds"
+        : "Seller must mark this order as shipped before you can release funds",
     );
   }
   try {

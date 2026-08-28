@@ -13,6 +13,7 @@ import { notifyUserEmail } from "../services/notify.js";
 import { estimateQuoteMinor } from "../services/freight-pricing.js";
 import { advanceShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
+import { mergeSellerDocsIntoBooking } from "../services/order-docs.js";
 
 export const logisticsRouter = Router();
 
@@ -93,6 +94,30 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
   return ok(res, serialize(result), 201);
 });
 
+logisticsRouter.get("/quotes/pending", requireAuth, async (req, res) => {
+  const orderId = typeof req.query.orderId === "string" ? req.query.orderId : "";
+  if (!orderId) return fail(res, 400, "VALIDATION", "orderId required");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: orderId, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+
+  const quote = await prisma.shippingQuote.findFirst({
+    where: {
+      request: { orderId, userId: req.user!.id },
+      shipment: null,
+      validUntil: { gt: new Date() },
+    },
+    include: { request: true },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!quote) return ok(res, null);
+
+  const mode = quote.request.mode;
+  const eta = mode === "AIR" ? "7–12 days" : mode === "EXPRESS" ? "5–8 days" : "26–32 days";
+  return ok(res, serialize({ ...quote, eta, rating: 4.7, includes: ["Insurance", "Customs paperwork"] }));
+});
+
 logisticsRouter.get("/quotes/:id", requireAuth, async (req, res) => {
   const quote = await prisma.shippingQuote.findUnique({
     where: { id: req.params.id },
@@ -105,6 +130,13 @@ logisticsRouter.get("/quotes/:id", requireAuth, async (req, res) => {
   const eta = mode === "AIR" ? "7–12 days" : mode === "EXPRESS" ? "5–8 days" : "26–32 days";
   return ok(res, serialize({ ...quote, eta, rating: 4.7, includes: ["Insurance", "Customs paperwork"] }));
 });
+
+function computeShipmentEta(mode: string): string {
+  const days = mode === "AIR" ? 10 : mode === "EXPRESS" ? 7 : mode === "CONSOLIDATED" ? 21 : 28;
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
+}
 
 logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
   const docBody = z
@@ -135,6 +167,10 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
 
   try {
     await assertKycForAction(req.user!.id, "logistics_book");
+    let bookingDocs = docBody.success ? docBody.data.documents ?? [] : [];
+    if (quote.request.orderId) {
+      bookingDocs = await mergeSellerDocsIntoBooking(quote.request.orderId, bookingDocs);
+    }
     const shipment = await prisma.$transaction(async (tx) => {
       await lockToHold(
         tx,
@@ -154,7 +190,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
           route: `${quote.request.origin} → ${quote.request.destination}`,
           mode: quote.request.mode,
           status: "HOLD_LOCKED",
-          eta: "14 days",
+          eta: computeShipmentEta(quote.request.mode),
         },
       });
       await tx.shipmentHold.create({
@@ -191,8 +227,8 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
           },
         });
       }
-      if (docBody.success && docBody.data.documents?.length) {
-        for (const d of docBody.data.documents) {
+      if (bookingDocs.length) {
+        for (const d of bookingDocs) {
           await tx.shipmentDocument.create({
             data: { shipmentId: s.id, kind: d.kind, name: d.name, url: d.url },
           });
@@ -257,7 +293,7 @@ logisticsRouter.get("/shipments/:id", requireAuth, async (req, res) => {
       documents: true,
       claims: { orderBy: { createdAt: "desc" } },
       quote: { include: { request: true } },
-      marketOrder: { select: { id: true, status: true, logisticsStatus: true } },
+      marketOrder: { select: { id: true, status: true, logisticsStatus: true, escrowId: true } },
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Shipment not found");
