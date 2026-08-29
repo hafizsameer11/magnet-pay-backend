@@ -399,6 +399,7 @@ model Recipient {
   currency             Currency                     @default(CNY)
   accountHint          String                       @default("")
   country              String                       @default("CN")
+  starred              Boolean                      @default(false)
   verificationStatus   RecipientVerificationStatus  @default(PENDING)
   verifiedAccountName  String?
   verificationMessage  String?
@@ -470,14 +471,16 @@ model Category {
 }
 
 model SellerStore {
-  id          String    @id @default(uuid())
-  userId      String    @unique
-  name        String
-  description String?   @db.Text
-  bannerUrl   String?
-  logoUrl     String?
-  verified    Boolean   @default(false)
-  createdAt   DateTime  @default(now())
+  id             String    @id @default(uuid())
+  userId         String    @unique
+  name           String
+  tagline        String?
+  description    String?   @db.Text
+  bannerUrl      String?
+  logoUrl        String?
+  storefrontMeta Json?
+  verified       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
   user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   products    Product[]
   favorites   FavoriteSupplier[]

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param, inputJson } from "../lib/http.js";
 import {
   mergeNotificationPrefs,
   parseDeviceTokens,
@@ -70,7 +70,7 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
         data: {
           type: body.data.type,
           tier: body.data.tier,
-          payload: mergedPayload,
+          payload: inputJson(mergedPayload),
           status: "SUBMITTED",
         },
       })
@@ -79,7 +79,7 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
           userId: req.user!.id,
           type: body.data.type,
           tier: body.data.tier,
-          payload: mergedPayload,
+          payload: inputJson(mergedPayload),
           status: "SUBMITTED",
         },
       });
@@ -118,13 +118,13 @@ meRouter.post("/kyb", requireAuth, async (req, res) => {
       userId: req.user!.id,
       companyName: body.data.companyName,
       licenseNo: body.data.licenseNo,
-      documents: nextDocs,
+      documents: inputJson(nextDocs),
       status: "SUBMITTED",
     },
     update: {
       companyName: body.data.companyName,
       licenseNo: body.data.licenseNo ?? existing?.licenseNo,
-      documents: nextDocs,
+      documents: inputJson(nextDocs),
       status: "SUBMITTED",
     },
   });
@@ -170,7 +170,7 @@ meRouter.post("/addresses", requireAuth, async (req, res) => {
 });
 
 meRouter.delete("/addresses/:id", requireAuth, async (req, res) => {
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const existing = await prisma.address.findFirst({ where: { id, userId: req.user!.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Address not found");
   await prisma.address.delete({ where: { id } });

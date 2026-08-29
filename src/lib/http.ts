@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
+import type { Prisma } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import { env } from "./prisma.js";
 
@@ -67,4 +68,14 @@ export function serialize<T>(value: T): T {
   return JSON.parse(
     JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
   );
+}
+
+/** Normalize Express route params to a single string. */
+export function param(req: Request, name: string): string {
+  const v = req.params[name];
+  return Array.isArray(v) ? v[0] : (v ?? "");
+}
+
+export function inputJson(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue;
 }

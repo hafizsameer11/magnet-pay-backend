@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { randomBytes } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param } from "../lib/http.js";
 import {
   formatMoney,
   lockToHold,
@@ -31,7 +31,7 @@ escrowRouter.get("/meta/inspectors", requireAuth, async (_req, res) => {
 });
 
 escrowRouter.get("/meta/terms/:id", requireAuth, async (req, res) => {
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const escrow = await prisma.escrow.findFirst({
     where: { id, OR: [{ buyerId: req.user!.id }, { sellerId: req.user!.id }] },
     include: { milestones: { orderBy: { sortOrder: "asc" } }, buyer: true, seller: true },
@@ -59,7 +59,7 @@ escrowRouter.get("/", requireAuth, async (req, res) => {
 });
 
 escrowRouter.get("/invite/:token", requireAuth, async (req, res) => {
-  const token = String(req.params.token);
+  const token = String(param(req, "token"));
   const invite = await prisma.escrowInvite.findUnique({
     where: { token },
     include: {
@@ -78,7 +78,7 @@ escrowRouter.get("/invite/:token", requireAuth, async (req, res) => {
 });
 
 escrowRouter.get("/:id", requireAuth, async (req, res) => {
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const row = await prisma.escrow.findFirst({
     where: {
       id,
@@ -173,7 +173,7 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
 
 escrowRouter.post("/invite/:token/decline", requireAuth, async (req, res) => {
   const invite = await prisma.escrowInvite.findUnique({
-    where: { token: req.params.token },
+    where: { token: param(req, "token") },
     include: { escrow: true },
   });
   if (!invite || invite.expiresAt < new Date()) {
@@ -197,7 +197,7 @@ escrowRouter.post("/invite/:token/decline", requireAuth, async (req, res) => {
 
 escrowRouter.post("/invite/:token/accept", requireAuth, async (req, res) => {
   const invite = await prisma.escrowInvite.findUnique({
-    where: { token: req.params.token },
+    where: { token: param(req, "token") },
     include: { escrow: true },
   });
   if (!invite || invite.expiresAt < new Date()) {
@@ -219,7 +219,7 @@ escrowRouter.post("/invite/:token/accept", requireAuth, async (req, res) => {
 
 escrowRouter.post("/:id/fund", requireAuth, async (req, res) => {
   const escrow = await prisma.escrow.findFirst({
-    where: { id: req.params.id, buyerId: req.user!.id },
+    where: { id: param(req, "id"), buyerId: req.user!.id },
     include: { milestones: true },
   });
   if (!escrow) return fail(res, 404, "NOT_FOUND", "Escrow not found");
@@ -284,11 +284,11 @@ escrowRouter.post("/:id/fund", requireAuth, async (req, res) => {
 
 escrowRouter.post("/:id/milestones/:msId/release", requireAuth, async (req, res) => {
   const escrow = await prisma.escrow.findFirst({
-    where: { id: req.params.id, buyerId: req.user!.id },
+    where: { id: param(req, "id"), buyerId: req.user!.id },
     include: { milestones: true },
   });
   if (!escrow?.sellerId) return fail(res, 404, "NOT_FOUND", "Escrow not found");
-  const ms = escrow.milestones.find((m) => m.id === req.params.msId);
+  const ms = escrow.milestones.find((m) => m.id === param(req, "msId"));
   if (!ms || ms.status !== "FUNDED") return fail(res, 400, "BAD_STATE", "Milestone not releasable");
 
   const gate = releaseGate({
@@ -366,7 +366,7 @@ escrowRouter.post("/:id/dispute", requireAuth, async (req, res) => {
   if (!body.success) return fail(res, 400, "VALIDATION", "Reason required");
   const escrow = await prisma.escrow.findFirst({
     where: {
-      id: req.params.id,
+      id: param(req, "id"),
       OR: [{ buyerId: req.user!.id }, { sellerId: req.user!.id }],
     },
   });
@@ -390,7 +390,7 @@ escrowRouter.post("/:id/documents", requireAuth, async (req, res) => {
     .object({ name: z.string().min(1), url: z.string().min(4), note: z.string().optional() })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const escrow = await prisma.escrow.findFirst({
     where: {
       id,
@@ -417,8 +417,8 @@ escrowRouter.post("/:id/documents", requireAuth, async (req, res) => {
 });
 
 escrowRouter.post("/:id/milestones/:msId/request-release", requireAuth, async (req, res) => {
-  const escrowId = String(req.params.id);
-  const msId = String(req.params.msId);
+  const escrowId = String(param(req, "id"));
+  const msId = String(param(req, "msId"));
   const escrow = await prisma.escrow.findFirst({
     where: { id: escrowId, sellerId: req.user!.id },
     include: { milestones: true },
@@ -454,7 +454,7 @@ escrowRouter.post("/:id/counter", requireAuth, async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid counter");
-  const escrowId = String(req.params.id);
+  const escrowId = String(param(req, "id"));
   const escrow = await prisma.escrow.findFirst({
     where: { id: escrowId, sellerId: req.user!.id },
   });
@@ -495,7 +495,7 @@ escrowRouter.post("/:id/counter", requireAuth, async (req, res) => {
 escrowRouter.post("/:id/dispute/messages", requireAuth, async (req, res) => {
   const body = z.object({ message: z.string().min(1) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "message required");
-  const escrowId = String(req.params.id);
+  const escrowId = String(param(req, "id"));
   const escrow = await prisma.escrow.findFirst({
     where: {
       id: escrowId,
@@ -531,7 +531,7 @@ escrowRouter.post("/:id/dispute/messages", requireAuth, async (req, res) => {
 });
 
 escrowRouter.post("/:id/cancel", requireAuth, async (req, res) => {
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const escrow = await prisma.escrow.findFirst({
     where: { id, OR: [{ buyerId: req.user!.id }, { sellerId: req.user!.id }] },
   });

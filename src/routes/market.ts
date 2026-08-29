@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param, inputJson } from "../lib/http.js";
 import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../services/ledger.js";
 import {
   generateCombinations,
@@ -80,7 +80,7 @@ async function syncProductVariants(
   if (!rows.length && variantAxes?.length) {
     rows = generateCombinations(variantAxes).map((options) => ({
       options,
-      priceMinor: basePriceMinor,
+      priceMinor: basePriceMinor.toString(),
     }));
   }
   for (const v of rows) {
@@ -150,7 +150,7 @@ marketRouter.get("/products", async (req, res) => {
 
 marketRouter.get("/products/:id", async (req, res) => {
   const product = await prisma.product.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       store: true,
       category: true,
@@ -174,7 +174,7 @@ marketRouter.get("/categories", async (_req, res) => {
 
 marketRouter.get("/stores/:id", async (req, res) => {
   const store = await prisma.sellerStore.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       user: { select: { id: true, name: true, avatarUrl: true } },
       products: { where: { active: true }, take: 40, orderBy: { createdAt: "desc" }, include: { category: true } },
@@ -195,9 +195,18 @@ marketRouter.patch("/seller/store", requireAuth, async (req, res) => {
   const body = z
     .object({
       name: z.string().min(2).optional(),
+      tagline: z.string().optional().nullable(),
       description: z.string().optional().nullable(),
       bannerUrl: z.string().url().optional().nullable(),
       logoUrl: z.string().url().optional().nullable(),
+      storefrontMeta: z
+        .object({
+          certifications: z.array(z.string()).optional(),
+          factoryPhotos: z.array(z.string()).optional(),
+          policies: z.array(z.object({ label: z.string(), summary: z.string() })).optional(),
+        })
+        .optional()
+        .nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid store");
@@ -206,9 +215,13 @@ marketRouter.patch("/seller/store", requireAuth, async (req, res) => {
     where: { id: store.id },
     data: {
       ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+      ...(body.data.tagline !== undefined ? { tagline: body.data.tagline } : {}),
       ...(body.data.description !== undefined ? { description: body.data.description } : {}),
       ...(body.data.bannerUrl !== undefined ? { bannerUrl: body.data.bannerUrl } : {}),
       ...(body.data.logoUrl !== undefined ? { logoUrl: body.data.logoUrl } : {}),
+      ...(body.data.storefrontMeta !== undefined
+        ? { storefrontMeta: body.data.storefrontMeta ? JSON.parse(JSON.stringify(body.data.storefrontMeta)) : null }
+        : {}),
     },
   });
   return ok(res, serialize(updated));
@@ -298,7 +311,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
 marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NO_STORE", "No seller store");
-  const existing = await prisma.product.findFirst({ where: { id: req.params.id, storeId: store.id } });
+  const existing = await prisma.product.findFirst({ where: { id: param(req, "id"), storeId: store.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
   const body = z
     .object({
@@ -378,7 +391,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
 marketRouter.delete("/seller/products/:id", requireAuth, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NO_STORE", "No seller store");
-  const existing = await prisma.product.findFirst({ where: { id: req.params.id, storeId: store.id } });
+  const existing = await prisma.product.findFirst({ where: { id: param(req, "id"), storeId: store.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
   await prisma.product.update({ where: { id: existing.id }, data: { active: false } });
   return ok(res, { id: existing.id, active: false });
@@ -404,7 +417,7 @@ marketRouter.get("/seller/orders/:id", requireAuth, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
     include: {
       items: { include: { product: true } },
       user: { select: { id: true, name: true, phone: true, avatarUrl: true, email: true } },
@@ -419,7 +432,7 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const body = z
     .object({
-      status: z.enum(["IN_ESCROW", "SHIPPED", "DISPUTED", "CANCELLED"]).optional(),
+      status: z.enum(["IN_ESCROW", "SHIPPED", "DELIVERED", "DISPUTED", "CANCELLED"]).optional(),
       tracking: z.string().optional(),
       carrier: z.string().optional(),
       note: z.string().optional(),
@@ -427,7 +440,7 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid update");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (body.data.status === "SHIPPED") {
@@ -513,8 +526,8 @@ async function saveSellerMeta(userId: string, patch: Record<string, unknown>) {
   const merged = { ...existing, ...patch };
   await prisma.businessProfile.upsert({
     where: { userId },
-    create: { userId, companyName: "Seller", documents: merged, status: "DRAFT" },
-    update: { documents: merged },
+    create: { userId, companyName: "Seller", documents: inputJson(merged), status: "DRAFT" },
+    update: { documents: inputJson(merged) },
   });
   return merged;
 }
@@ -557,7 +570,7 @@ marketRouter.get("/seller/orders/:id/documents", requireAuth, async (req, res) =
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const payload = await orderDocumentsForSeller(req.user!.id, order.id);
@@ -570,7 +583,7 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) 
   const body = z.object({ kind: z.string(), name: z.string(), url: z.string().min(4) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const meta = await sellerMeta(req.user!.id);
@@ -588,7 +601,7 @@ marketRouter.post("/seller/orders/:id/documents/send", requireAuth, async (req, 
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
     include: { user: { select: { id: true, name: true } } },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
@@ -695,7 +708,7 @@ marketRouter.patch("/cart/items/:id", requireAuth, async (req, res) => {
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid qty");
   const cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
   if (!cart) return fail(res, 404, "NOT_FOUND", "Cart not found");
-  const existing = await prisma.cartItem.findFirst({ where: { id: req.params.id, cartId: cart.id } });
+  const existing = await prisma.cartItem.findFirst({ where: { id: param(req, "id"), cartId: cart.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Item not found");
   const item = await prisma.cartItem.update({
     where: { id: existing.id },
@@ -708,7 +721,7 @@ marketRouter.patch("/cart/items/:id", requireAuth, async (req, res) => {
 marketRouter.delete("/cart/items/:id", requireAuth, async (req, res) => {
   const cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
   if (!cart) return fail(res, 404, "NOT_FOUND", "Cart not found");
-  const existing = await prisma.cartItem.findFirst({ where: { id: req.params.id, cartId: cart.id } });
+  const existing = await prisma.cartItem.findFirst({ where: { id: param(req, "id"), cartId: cart.id } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Item not found");
   await prisma.cartItem.delete({ where: { id: existing.id } });
   return ok(res, { id: existing.id, deleted: true });
@@ -896,7 +909,7 @@ marketRouter.get("/orders", requireAuth, async (req, res) => {
 
 marketRouter.get("/orders/:id", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
     include: {
       items: { include: { product: true, variant: true } },
       shipment: { select: { id: true, ref: true, route: true, status: true, eta: true } },
@@ -915,7 +928,7 @@ marketRouter.get("/orders/:id", requireAuth, async (req, res) => {
 
 marketRouter.get("/orders/:id/documents", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const payload = await orderDocumentsForBuyer(order.id);
@@ -923,7 +936,7 @@ marketRouter.get("/orders/:id/documents", requireAuth, async (req, res) => {
 });
 
 marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
-  const orderId = String(req.params.id);
+  const orderId = String(param(req, "id"));
   const order = await prisma.marketOrder.findFirst({
     where: { id: orderId, userId: req.user!.id },
     include: { items: true },
@@ -979,7 +992,7 @@ marketRouter.post("/orders/:id/reorder", requireAuth, async (req, res) => {
 /** Buyer confirms receipt. With a linked shipment, POD must complete first. Without shipment, this marks the order delivered. */
 marketRouter.post("/orders/:id/confirm-delivery", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (order.status === "DELIVERED" || order.status === "COMPLETED") {
@@ -1019,7 +1032,7 @@ marketRouter.post("/orders/:id/confirm-delivery", requireAuth, async (req, res) 
 
 marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (order.status === "COMPLETED") return ok(res, serialize(order));
@@ -1093,7 +1106,7 @@ marketRouter.post("/orders/:id/dispute", requireAuth, async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid dispute");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const updated = await prisma.marketOrder.update({
@@ -1124,7 +1137,7 @@ marketRouter.post("/orders/:id/reviews", requireAuth, async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid review");
   const order = await prisma.marketOrder.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
     include: { items: true },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
@@ -1180,7 +1193,7 @@ marketRouter.post("/wishlist", requireAuth, async (req, res) => {
 
 marketRouter.delete("/wishlist/:productId", requireAuth, async (req, res) => {
   await prisma.wishlistItem.deleteMany({
-    where: { userId: req.user!.id, productId: req.params.productId },
+    where: { userId: req.user!.id, productId: param(req, "productId") },
   });
   return ok(res, { deleted: true });
 });
@@ -1214,7 +1227,7 @@ marketRouter.post("/favorite-sellers", requireAuth, async (req, res) => {
 
 marketRouter.delete("/favorite-sellers/:sellerStoreId", requireAuth, async (req, res) => {
   await prisma.favoriteSupplier.deleteMany({
-    where: { userId: req.user!.id, sellerStoreId: String(req.params.sellerStoreId) },
+    where: { userId: req.user!.id, sellerStoreId: String(param(req, "sellerStoreId")) },
   });
   return ok(res, { deleted: true });
 });
@@ -1352,7 +1365,7 @@ marketRouter.get("/team/invites", requireAuth, async (req, res) => {
 });
 
 marketRouter.post("/team/invites/:token/accept", requireAuth, async (req, res) => {
-  const token = String(req.params.token);
+  const token = String(param(req, "token"));
   const invite = await prisma.sellerTeamInvite.findUnique({ where: { token } });
   if (!invite || invite.status !== "pending") return fail(res, 404, "NOT_FOUND", "Invite not found");
   if (invite.expiresAt < new Date()) return fail(res, 410, "EXPIRED", "Invite expired");
@@ -1487,7 +1500,7 @@ marketRouter.get("/seller/rfq", requireAuth, async (req, res) => {
 
 marketRouter.get("/rfq/:id", requireAuth, async (req, res) => {
   const rfq = await prisma.rfq.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       buyer: { select: { id: true, name: true, phone: true } },
       quotes: {
@@ -1513,7 +1526,7 @@ marketRouter.post("/rfq/:id/quotes", requireAuth, async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid quote");
-  const rfq = await prisma.rfq.findUnique({ where: { id: req.params.id } });
+  const rfq = await prisma.rfq.findUnique({ where: { id: param(req, "id") } });
   if (!rfq) return fail(res, 404, "NOT_FOUND", "RFQ not found");
   const quote = await prisma.rfqQuote.create({
     data: {
@@ -1537,7 +1550,7 @@ marketRouter.post("/rfq/:id/quotes", requireAuth, async (req, res) => {
 
 marketRouter.get("/quotes/:id", requireAuth, async (req, res) => {
   const quote = await prisma.rfqQuote.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       seller: { select: { id: true, name: true, avatarUrl: true, phone: true } },
       rfq: { include: { buyer: { select: { id: true, name: true } } } },

@@ -1,5 +1,5 @@
 import type { Currency, LedgerAccountType, Prisma } from "@prisma/client";
-import { prisma } from "./prisma.js";
+import { prisma } from "../lib/prisma.js";
 
 export async function ensureUserLedgerAccounts(tx: Prisma.TransactionClient, userId: string, currency: Currency) {
   const types: LedgerAccountType[] = ["USER_WALLET", "ESCROW_HOLD", "LOGISTICS_HOLD"];

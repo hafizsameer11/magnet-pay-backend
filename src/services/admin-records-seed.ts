@@ -58,14 +58,45 @@ const SEED: SeedRow[] = [
   { domain: "seller-tier", externalId: "tier-pro", title: "Verified Pro", status: "active", payload: { sellers: 142, minGmv: 1000000 } },
   { domain: "seller-tier", externalId: "tier-verified", title: "Verified", status: "active", payload: { sellers: 612, minGmv: 100000 } },
   { domain: "seller-tier", externalId: "tier-new", title: "New", status: "active", payload: { sellers: 482, minGmv: 0 } },
+  // Shipment exceptions
+  { domain: "shipment-exception", externalId: "EXC-4412", title: "MSK-882104 · Customs hold", subtitle: "Guangzhou → Lagos", status: "open", payload: { reason: "Missing HS code", carrier: "SF Express", ageHours: 6 } },
+  { domain: "shipment-exception", externalId: "EXC-4408", title: "MSK-881902 · Address mismatch", subtitle: "Yiwu → Abuja", status: "resolved", payload: { reason: "Consignee phone invalid", carrier: "DHL", ageHours: 18 } },
+  // Platform general settings
+  { domain: "platform-config", externalId: "CFG-001", title: "Platform name", status: "active", payload: { category: "general", value: "MagnetPay" } },
+  { domain: "platform-config", externalId: "CFG-002", title: "Support email", status: "active", payload: { category: "general", value: "support@magnetpay.io" } },
+  { domain: "platform-config", externalId: "CFG-003", title: "Default locale", status: "active", payload: { category: "general", value: "en-NG" } },
+  // FX currencies
+  { domain: "fx-currency", externalId: "USD", title: "US Dollar", status: "active", payload: { symbol: "$", enabled: true, decimals: 2 } },
+  { domain: "fx-currency", externalId: "NGN", title: "Nigerian Naira", status: "active", payload: { symbol: "₦", enabled: true, decimals: 2 } },
+  { domain: "fx-currency", externalId: "CNY", title: "Chinese Yuan", status: "active", payload: { symbol: "¥", enabled: true, decimals: 2 } },
+  { domain: "shipping-zone", externalId: "ZN-NG-LG", title: "Lagos metro", status: "active", payload: { country: "NG", etaDays: 3 } },
+  { domain: "shipping-zone", externalId: "ZN-CN-GZ", title: "Guangzhou export", status: "active", payload: { country: "CN", etaDays: 5 } },
+  { domain: "shipping-label", externalId: "LBL-A6", title: "A6 thermal label", status: "active", payload: { format: "100×150mm", carrier: "All" } },
+  { domain: "pickup-point", externalId: "PU-LAG-01", title: "Apapa pickup hub", status: "active", payload: { city: "Lagos", hours: "8am–6pm" } },
+  { domain: "customs-config", externalId: "CUS-HS", title: "Default HS validation", status: "active", payload: { minDigits: 4, requireForBook: true } },
+  { domain: "fx-rate", externalId: "FX-USD-NGN", title: "USD → NGN", status: "active", payload: { rate: 1580, spreadBps: 45 } },
+  { domain: "fx-corridor", externalId: "CR-NG-CN", title: "Nigeria ↔ China", status: "active", payload: { currencies: ["NGN", "CNY", "USD"], status: "live" } },
+  { domain: "velocity-rule", externalId: "VEL-001", title: "Transfers / 24h", status: "active", payload: { threshold: "5/day", action: "review" } },
+  { domain: "security-policy", externalId: "SEC-2FA", title: "Staff 2FA required", status: "active", payload: { enforced: true, graceDays: 7 } },
+  { domain: "platform-secret", externalId: "SEC-NOMBA", title: "Nomba API secret", status: "active", payload: { rotatedAt: "2026-06-01", env: "production" } },
+  { domain: "api-key", externalId: "KEY-001", title: "Alibaba webhook key", status: "active", payload: { scopes: ["orders.read"], lastUsed: "2h ago" } },
+  { domain: "integration", externalId: "INT-NOMBA", title: "Nomba payouts", status: "active", payload: { mode: "mock", health: "ok" } },
+  { domain: "dispute-sla", externalId: "SLA-STD", title: "Standard dispute SLA", status: "active", payload: { hours: 72, autoEscalate: true } },
 ];
 
-export async function seedAdminRecords() {
-  const count = await prisma.adminRecord.count();
-  if (count > 0) return;
+function seedPayload(payload?: Record<string, unknown>) {
+  return JSON.parse(JSON.stringify(payload ?? {}));
+}
 
+export async function seedAdminRecords() {
   for (let i = 0; i < SEED.length; i++) {
     const row = SEED[i];
+    if (row.externalId) {
+      const existing = await prisma.adminRecord.findFirst({
+        where: { domain: row.domain, externalId: row.externalId },
+      });
+      if (existing) continue;
+    }
     await prisma.adminRecord.create({
       data: {
         domain: row.domain,
@@ -73,7 +104,7 @@ export async function seedAdminRecords() {
         title: row.title,
         subtitle: row.subtitle,
         status: row.status,
-        payload: row.payload ?? {},
+        payload: seedPayload(row.payload),
         sortOrder: row.sortOrder ?? i,
       },
     });

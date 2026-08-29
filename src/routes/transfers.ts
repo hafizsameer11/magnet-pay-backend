@@ -1,13 +1,14 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param } from "../lib/http.js";
 import { creditWallet, debitWallet, formatMoney, recordTx } from "../services/ledger.js";
 import { getNombaProvider } from "../services/nomba.js";
 import { assertRecipientVerified, verifyRecipientById } from "../services/recipient-verify.js";
 import { deliverUserNotification } from "../services/deliver.js";
 import { assertWithinDailyLimit } from "../services/limits.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
+import { notifyUserEmail } from "../services/notify.js";
 
 export const recipientsRouter = Router();
 export const transfersRouter = Router();
@@ -49,14 +50,14 @@ recipientsRouter.post("/", requireAuth, async (req, res) => {
 });
 
 recipientsRouter.post("/:id/verify", requireAuth, async (req, res) => {
-  const updated = await verifyRecipientById(req.params.id, req.user!.id);
+  const updated = await verifyRecipientById(param(req, "id"), req.user!.id);
   if (!updated) return fail(res, 404, "NOT_FOUND", "Recipient not found");
   return ok(res, serialize(updated));
 });
 
 recipientsRouter.get("/:id", requireAuth, async (req, res) => {
   const row = await prisma.recipient.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Recipient not found");
   return ok(res, serialize(row));
@@ -64,11 +65,35 @@ recipientsRouter.get("/:id", requireAuth, async (req, res) => {
 
 recipientsRouter.delete("/:id", requireAuth, async (req, res) => {
   const row = await prisma.recipient.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Recipient not found");
   await prisma.recipient.delete({ where: { id: row.id } });
   return ok(res, { ok: true });
+});
+
+recipientsRouter.patch("/:id", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(2).optional(),
+      subtitle: z.string().optional(),
+      starred: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid recipient update");
+  const row = await prisma.recipient.findFirst({
+    where: { id: param(req, "id"), userId: req.user!.id },
+  });
+  if (!row) return fail(res, 404, "NOT_FOUND", "Recipient not found");
+  const updated = await prisma.recipient.update({
+    where: { id: row.id },
+    data: {
+      ...(body.data.name !== undefined ? { name: body.data.name } : {}),
+      ...(body.data.subtitle !== undefined ? { subtitle: body.data.subtitle } : {}),
+      ...(body.data.starred !== undefined ? { starred: body.data.starred } : {}),
+    },
+  });
+  return ok(res, serialize(updated));
 });
 
 transfersRouter.get("/", requireAuth, async (req, res) => {
@@ -82,7 +107,7 @@ transfersRouter.get("/", requireAuth, async (req, res) => {
 
 transfersRouter.get("/:id", requireAuth, async (req, res) => {
   const row = await prisma.transfer.findFirst({
-    where: { id: req.params.id, senderId: req.user!.id },
+    where: { id: param(req, "id"), senderId: req.user!.id },
     include: { recipient: true, events: { orderBy: { createdAt: "asc" } } },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Transfer not found");
@@ -220,7 +245,7 @@ transfersRouter.post("/", requireAuth, async (req, res) => {
 
 transfersRouter.post("/:id/retry", requireAuth, async (req, res) => {
   const row = await prisma.transfer.findFirst({
-    where: { id: req.params.id, senderId: req.user!.id },
+    where: { id: param(req, "id"), senderId: req.user!.id },
     include: { recipient: true },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Transfer not found");
@@ -264,7 +289,7 @@ transfersRouter.post("/:id/retry", requireAuth, async (req, res) => {
 
 transfersRouter.post("/:id/refund", requireAuth, async (req, res) => {
   const row = await prisma.transfer.findFirst({
-    where: { id: req.params.id, senderId: req.user!.id },
+    where: { id: param(req, "id"), senderId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Transfer not found");
   if (!["FAILED", "PROCESSING", "REFUNDED"].includes(row.status)) {

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, requireAdmin, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, requireAdmin, serialize, param } from "../lib/http.js";
 import { z } from "zod";
 import { deliverUserNotification } from "../services/deliver.js";
 import { formatMoney } from "../services/ledger.js";
@@ -31,6 +31,7 @@ import {
   getAdminRecord,
   createAdminRecord,
   patchAdminRecord,
+  upsertSupportTicketRecord,
 } from "../services/admin-records.js";
 import { seedAdminRecords } from "../services/admin-records-seed.js";
 import { registerAdminExtensions } from "./admin-extensions.js";
@@ -50,7 +51,7 @@ notificationsRouter.get("/", requireAuth, async (req, res) => {
 
 notificationsRouter.post("/:id/read", requireAuth, async (req, res) => {
   const row = await prisma.notification.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Not found");
   const updated = await prisma.notification.update({
@@ -129,7 +130,7 @@ messagesRouter.patch("/conversations/:id", requireAuth, async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid prefs");
   const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId: req.params.id, userId: req.user!.id },
+    where: { conversationId: param(req, "id"), userId: req.user!.id },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
   const updated = await prisma.conversationParticipant.update({
@@ -171,7 +172,7 @@ messagesRouter.post("/block", requireAuth, async (req, res) => {
 });
 
 messagesRouter.get("/conversations/:id", requireAuth, async (req, res) => {
-  const ctx = await getConversationContext(String(req.params.id), req.user!.id);
+  const ctx = await getConversationContext(String(param(req, "id")), req.user!.id);
   if (!ctx) return fail(res, 404, "NOT_FOUND", "Conversation not found");
   return ok(res, serialize(ctx));
 });
@@ -184,11 +185,11 @@ messagesRouter.patch("/conversations/:id", requireAuth, async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid update");
   const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId: req.params.id, userId: req.user!.id },
+    where: { conversationId: param(req, "id"), userId: req.user!.id },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
   const updated = await prisma.conversation.update({
-    where: { id: String(req.params.id) },
+    where: { id: String(param(req, "id")) },
     data: {
       ...(body.data.productId !== undefined ? { productId: body.data.productId } : {}),
     },
@@ -210,7 +211,7 @@ messagesRouter.post("/conversations/:id/quote", requireAuth, async (req, res) =>
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
   try {
     const result = await upsertChatQuote({
-      conversationId: String(req.params.id),
+      conversationId: String(param(req, "id")),
       sellerId: req.user!.id,
       amountMinor,
       currency: body.data.currency,
@@ -258,11 +259,11 @@ messagesRouter.post("/conversations", requireAuth, async (req, res) => {
 
 messagesRouter.get("/conversations/:id/messages", requireAuth, async (req, res) => {
   const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId: req.params.id, userId: req.user!.id },
+    where: { conversationId: param(req, "id"), userId: req.user!.id },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
   const messages = await prisma.message.findMany({
-    where: { conversationId: req.params.id },
+    where: { conversationId: param(req, "id") },
     orderBy: { createdAt: "asc" },
     include: {
       quote: {
@@ -288,19 +289,19 @@ messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res)
   const attachmentUrl = body.data.attachmentUrl || null;
   if (!text && !attachmentUrl) return fail(res, 400, "VALIDATION", "body or attachment required");
   const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId: req.params.id, userId: req.user!.id },
+    where: { conversationId: param(req, "id"), userId: req.user!.id },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
   const msg = await prisma.message.create({
     data: {
-      conversationId: req.params.id,
+      conversationId: param(req, "id"),
       senderId: req.user!.id,
       body: text || (attachmentUrl ? "Attachment" : ""),
       attachmentUrl,
     },
   });
   await prisma.conversation.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: { updatedAt: new Date() },
   });
   return ok(res, serialize(msg), 201);
@@ -329,6 +330,12 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
     },
     include: { conversation: true },
   });
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { id: true, name: true },
+  });
+  if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+
   if (existing) {
     const msg = await prisma.message.create({
       data: {
@@ -337,6 +344,13 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
         body: `[${body.data.topic}] ${body.data.message}`,
       },
     });
+    await upsertSupportTicketRecord({
+      userId: user.id,
+      userName: user.name,
+      topic: body.data.topic,
+      conversationId: existing.conversationId,
+      channel: "in_app",
+    }).catch(() => {});
     return ok(res, serialize({ conversationId: existing.conversationId, message: msg }));
   }
   const conv = await prisma.$transaction(async (tx) => {
@@ -357,6 +371,13 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
     });
     return { conversationId: c.id, message: msg };
   });
+  await upsertSupportTicketRecord({
+    userId: user.id,
+    userName: user.name,
+    topic: body.data.topic,
+    conversationId: conv.conversationId,
+    channel: "in_app",
+  }).catch(() => {});
   return ok(res, serialize(conv), 201);
 });
 
@@ -406,7 +427,7 @@ adminRouter.get("/kyc", async (req, res) => {
 
 adminRouter.get("/kyc/:id", async (req, res) => {
   const app = await prisma.kycApplication.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: { user: { select: { id: true, name: true, phone: true, email: true } } },
   });
   if (!app) return fail(res, 404, "NOT_FOUND", "KYC application not found");
@@ -421,12 +442,12 @@ adminRouter.post("/kyc/:id/decide", async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "status required");
-  const existing = await prisma.kycApplication.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.kycApplication.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "KYC application not found");
 
   const prevPayload = (existing.payload as Record<string, unknown> | null) ?? {};
   const app = await prisma.kycApplication.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: {
       status: body.data.status,
       payload: (body.data.note ? { ...prevPayload, adminNote: body.data.note } : prevPayload) as object,
@@ -478,7 +499,7 @@ adminRouter.get("/kyb", async (req, res) => {
 
 adminRouter.get("/kyb/:id", async (req, res) => {
   const profile = await prisma.businessProfile.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: { user: { select: { id: true, name: true, phone: true, email: true } } },
   });
   if (!profile) return fail(res, 404, "NOT_FOUND", "KYB profile not found");
@@ -493,12 +514,12 @@ adminRouter.post("/kyb/:id/decide", async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "status required");
-  const existing = await prisma.businessProfile.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.businessProfile.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "KYB profile not found");
 
   const prevDocs = (existing.documents as Record<string, unknown> | null) ?? {};
   const profile = await prisma.businessProfile.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: {
       status: body.data.status,
       documents: (body.data.note ? { ...prevDocs, adminNote: body.data.note } : prevDocs) as object,
@@ -609,7 +630,7 @@ adminRouter.post("/escrows/:id/resolve", async (req, res) => {
   const body = z.object({ outcome: z.string().min(3) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "outcome required");
   const escrow = await prisma.escrow.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: { status: "RESOLVED" },
   });
   await prisma.dispute.updateMany({
@@ -653,7 +674,7 @@ const userSelect = { id: true, name: true, phone: true, email: true } as const;
 
 adminRouter.get("/users/:id", async (req, res) => {
   const user = await prisma.user.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       wallets: true,
       kycApplications: { orderBy: { createdAt: "desc" } },
@@ -675,7 +696,7 @@ adminRouter.patch("/users/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
 
-  const existing = await prisma.user.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.user.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "User not found");
 
   const data: { name?: string; role?: "BUYER" | "SELLER" | "BOTH"; platformRole?: "USER" | "ADMIN" | "SUPER_ADMIN" } =
@@ -686,7 +707,7 @@ adminRouter.patch("/users/:id", async (req, res) => {
 
   const user =
     Object.keys(data).length > 0
-      ? await prisma.user.update({ where: { id: req.params.id }, data })
+      ? await prisma.user.update({ where: { id: param(req, "id") }, data })
       : existing;
 
   if (body.data.suspended !== undefined) {
@@ -733,7 +754,7 @@ adminRouter.get("/deposits", async (_req, res) => {
 
 adminRouter.get("/deposits/:id", async (req, res) => {
   const row = await prisma.deposit.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: { user: { select: userSelect } },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Deposit not found");
@@ -753,13 +774,13 @@ adminRouter.post("/withdrawals/:id/decide", async (req, res) => {
   const body = z.object({ status: z.enum(["APPROVED", "REJECTED"]) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "status required");
 
-  const existing = await prisma.withdrawal.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.withdrawal.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Withdrawal not found");
 
   // WithdrawalStatus: PENDING | PROCESSING | SUCCEEDED | FAILED
   const mapped = body.data.status === "APPROVED" ? ("SUCCEEDED" as const) : ("FAILED" as const);
   const row = await prisma.withdrawal.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: { status: mapped },
     include: { user: { select: userSelect } },
   });
@@ -823,7 +844,7 @@ adminRouter.get("/orders", async (_req, res) => {
 
 adminRouter.get("/orders/:id", async (req, res) => {
   const row = await prisma.marketOrder.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       items: { include: { product: true } },
       user: { select: userSelect },
@@ -834,11 +855,11 @@ adminRouter.get("/orders/:id", async (req, res) => {
 });
 
 adminRouter.post("/orders/:id/cancel", async (req, res) => {
-  const existing = await prisma.marketOrder.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.marketOrder.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Order not found");
 
   const row = await prisma.marketOrder.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: { status: "CANCELLED" },
     include: { items: true, user: { select: userSelect } },
   });
@@ -865,7 +886,7 @@ adminRouter.post("/orders/:id/mark-shipped", async (req, res) => {
     .safeParse(req.body ?? {});
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid payload");
 
-  const order = await prisma.marketOrder.findUnique({ where: { id: req.params.id } });
+  const order = await prisma.marketOrder.findUnique({ where: { id: param(req, "id") } });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (!["IN_ESCROW", "SHIPPED"].includes(order.status)) {
     return fail(res, 400, "BAD_STATUS", `Cannot mark shipped from ${order.status}`);
@@ -937,7 +958,7 @@ adminRouter.get("/products", async (_req, res) => {
 
 adminRouter.get("/products/:id", async (req, res) => {
   const row = await prisma.product.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       store: { include: { user: { select: userSelect } } },
       category: true,
@@ -968,7 +989,7 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
     return fail(res, 400, "VALIDATION", "status or active required");
   }
 
-  const existing = await prisma.product.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.product.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
 
   // Product has `active` boolean — map moderation statuses
@@ -987,7 +1008,7 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
   }
 
   const row = await prisma.product.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: { active, moderationStatus },
     include: { store: true, category: true, brand: true },
   });
@@ -998,6 +1019,75 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
       entity: "Product",
       entityId: row.id,
       meta: { status: body.data.status, active },
+    },
+  });
+  return ok(res, serialize(row));
+});
+
+const adminProductPatchSchema = z.object({
+  title: z.string().min(2).optional(),
+  description: z.string().optional().nullable(),
+  priceMinor: z.union([z.string(), z.number()]).optional(),
+  moq: z.string().optional(),
+  categoryId: z.string().uuid().optional().nullable(),
+  active: z.boolean().optional(),
+  stock: z.number().int().nonnegative().optional().nullable(),
+  cbmPerUnit: z.number().positive().optional().nullable(),
+  weightKgPerUnit: z.number().positive().optional().nullable(),
+  originHub: z.string().min(1).optional().nullable(),
+  leadTimeMin: z.number().int().nonnegative().optional().nullable(),
+  leadTimeMax: z.number().int().nonnegative().optional().nullable(),
+  packagingType: z.string().min(1).optional().nullable(),
+  defaultIncoterm: z.string().min(2).optional().nullable(),
+  parcelTypeId: z.string().uuid().optional().nullable(),
+});
+
+adminRouter.patch("/products/:id", async (req, res) => {
+  const existing = await prisma.product.findUnique({ where: { id: param(req, "id") } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
+  const body = adminProductPatchSchema.safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product fields");
+
+  const row = await prisma.product.update({
+    where: { id: existing.id },
+    data: {
+      ...(body.data.title !== undefined ? { title: body.data.title } : {}),
+      ...(body.data.description !== undefined ? { description: body.data.description } : {}),
+      ...(body.data.priceMinor !== undefined ? { priceMinor: BigInt(body.data.priceMinor) } : {}),
+      ...(body.data.moq !== undefined ? { moq: body.data.moq } : {}),
+      ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
+      ...(body.data.active !== undefined ? { active: body.data.active } : {}),
+      ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
+      ...(body.data.cbmPerUnit !== undefined ? { cbmPerUnit: body.data.cbmPerUnit } : {}),
+      ...(body.data.weightKgPerUnit !== undefined ? { weightKgPerUnit: body.data.weightKgPerUnit } : {}),
+      ...(body.data.originHub !== undefined ? { originHub: body.data.originHub } : {}),
+      ...(body.data.leadTimeMin !== undefined ? { leadTimeMin: body.data.leadTimeMin } : {}),
+      ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
+      ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
+      ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
+      ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
+    },
+    include: {
+      store: { include: { user: { select: userSelect } } },
+      category: true,
+      brand: true,
+      media: { orderBy: { sortOrder: "asc" } },
+      variants: { orderBy: { createdAt: "asc" } },
+      reviews: {
+        orderBy: { createdAt: "desc" },
+        take: 10,
+        include: { user: { select: userSelect } },
+      },
+      _count: { select: { orderItems: true, reviews: true } },
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "product.update",
+      entity: "Product",
+      entityId: row.id,
+      meta: { fields: Object.keys(body.data) },
     },
   });
   return ok(res, serialize(row));
@@ -1046,11 +1136,11 @@ adminRouter.patch("/categories/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
 
-  const existing = await prisma.category.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.category.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Category not found");
 
   const row = await prisma.category.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: {
       ...(body.data.slug !== undefined ? { slug: body.data.slug } : {}),
       ...(body.data.name !== undefined ? { name: body.data.name } : {}),
@@ -1079,7 +1169,7 @@ adminRouter.get("/sellers", async (_req, res) => {
 
 adminRouter.get("/sellers/:id", async (req, res) => {
   const row = await prisma.sellerStore.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       user: { select: userSelect },
       products: { orderBy: { createdAt: "desc" }, take: 50 },
@@ -1100,11 +1190,11 @@ adminRouter.patch("/sellers/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
 
-  const existing = await prisma.sellerStore.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.sellerStore.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Seller store not found");
 
   const row = await prisma.sellerStore.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: body.data,
     include: {
       user: { select: userSelect },
@@ -1129,7 +1219,7 @@ adminRouter.get("/reviews", async (_req, res) => {
 
 adminRouter.get("/escrows/:id", async (req, res) => {
   const row = await prisma.escrow.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       milestones: { orderBy: { sortOrder: "asc" } },
       disputes: { include: { openedBy: { select: userSelect } } },
@@ -1156,7 +1246,7 @@ adminRouter.get("/disputes", async (_req, res) => {
 
 adminRouter.get("/shipments/:id", async (req, res) => {
   const row = await prisma.shipment.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       user: { select: userSelect },
       hold: true,
@@ -1364,10 +1454,10 @@ adminRouter.put("/fees/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "value required");
 
-  const byId = await prisma.feeConfig.findUnique({ where: { id: req.params.id } });
+  const byId = await prisma.feeConfig.findUnique({ where: { id: param(req, "id") } });
   if (byId) {
     const row = await prisma.feeConfig.update({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       data: {
         value: body.data.value,
         ...(body.data.key !== undefined ? { key: body.data.key } : {}),
@@ -1386,7 +1476,7 @@ adminRouter.put("/fees/:id", async (req, res) => {
   }
 
   // Treat :id as key for upsert convenience
-  const key = body.data.key ?? req.params.id;
+  const key = body.data.key ?? param(req, "id");
   const row = await prisma.feeConfig.upsert({
     where: { key },
     create: { key, value: body.data.value },
@@ -1527,10 +1617,10 @@ adminRouter.patch("/logistics/parcel-types/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid parcel type patch");
 
-  const existing = await prisma.parcelType.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.parcelType.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Parcel type not found");
 
-  const row = await prisma.parcelType.update({ where: { id: req.params.id }, data: body.data });
+  const row = await prisma.parcelType.update({ where: { id: param(req, "id") }, data: body.data });
   await prisma.auditLog.create({
     data: {
       actorId: req.user!.id,
@@ -1584,7 +1674,7 @@ adminRouter.get("/logistics/partners", async (_req, res) => {
 
 adminRouter.get("/logistics/partners/:id", async (req, res) => {
   const row = await prisma.logisticsPartner.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: {
       rates: {
         orderBy: [{ sortOrder: "asc" }, { mode: "asc" }],
@@ -1659,11 +1749,11 @@ adminRouter.patch("/logistics/partners/:id", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid partner update");
 
-  const existing = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  const existing = await prisma.logisticsPartner.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Partner not found");
 
   const row = await prisma.logisticsPartner.update({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     data: {
       ...(body.data.name !== undefined ? { name: body.data.name } : {}),
       ...(body.data.code !== undefined ? { code: body.data.code.toUpperCase() } : {}),
@@ -1691,7 +1781,7 @@ adminRouter.patch("/logistics/partners/:id", async (req, res) => {
 });
 
 adminRouter.get("/logistics/partners/:id/rates", async (req, res) => {
-  const partner = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  const partner = await prisma.logisticsPartner.findUnique({ where: { id: param(req, "id") } });
   if (!partner) return fail(res, 404, "NOT_FOUND", "Partner not found");
   const rows = await prisma.logisticsPartnerRate.findMany({
     where: { partnerId: partner.id },
@@ -1702,7 +1792,7 @@ adminRouter.get("/logistics/partners/:id/rates", async (req, res) => {
 });
 
 adminRouter.post("/logistics/partners/:id/rates", async (req, res) => {
-  const partner = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  const partner = await prisma.logisticsPartner.findUnique({ where: { id: param(req, "id") } });
   if (!partner) return fail(res, 404, "NOT_FOUND", "Partner not found");
   const body = z
     .object({
@@ -1741,7 +1831,7 @@ adminRouter.post("/logistics/partners/:id/rates", async (req, res) => {
 
 adminRouter.patch("/logistics/partners/:partnerId/rates/:rateId", async (req, res) => {
   const existing = await prisma.logisticsPartnerRate.findFirst({
-    where: { id: req.params.rateId, partnerId: req.params.partnerId },
+    where: { id: param(req, "rateId"), partnerId: param(req, "partnerId") },
   });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Rate not found");
   const body = z
@@ -1781,7 +1871,7 @@ adminRouter.patch("/logistics/partners/:partnerId/rates/:rateId", async (req, re
 
 adminRouter.delete("/logistics/partners/:partnerId/rates/:rateId", async (req, res) => {
   const existing = await prisma.logisticsPartnerRate.findFirst({
-    where: { id: req.params.rateId, partnerId: req.params.partnerId },
+    where: { id: param(req, "rateId"), partnerId: param(req, "partnerId") },
   });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Rate not found");
   await prisma.logisticsPartnerRate.delete({ where: { id: existing.id } });
@@ -1815,7 +1905,7 @@ adminRouter.post("/shipments/:id/advance", async (req, res) => {
 
   try {
     const updated = await advanceShipmentOps({
-      shipmentId: req.params.id,
+      shipmentId: param(req, "id"),
       status: body.data.status,
       message: body.data.message,
       skipPodCheck: true,
@@ -1853,7 +1943,7 @@ adminRouter.post("/shipments/:id/settle", async (req, res) => {
 
   try {
     const result = await settleShipmentOps({
-      shipmentId: req.params.id,
+      shipmentId: param(req, "id"),
       finalMinor: body.data.finalMinor != null ? BigInt(body.data.finalMinor) : undefined,
       breakdown: body.data.breakdown,
       notes: body.data.notes,
@@ -1863,7 +1953,7 @@ adminRouter.post("/shipments/:id/settle", async (req, res) => {
         actorId: req.user!.id,
         action: "shipment.settle",
         entity: "Shipment",
-        entityId: req.params.id,
+        entityId: param(req, "id"),
         meta: {
           finalMinor: String(result.settlement.finalMinor),
           topUpMinor: String(result.settlement.topUpMinor),
@@ -1883,7 +1973,7 @@ adminRouter.post("/shipments/:id/settle", async (req, res) => {
 
 adminRouter.get("/shipments/:id/documents", async (req, res) => {
   const shipment = await prisma.shipment.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: { documents: { orderBy: { createdAt: "desc" } } },
   });
   if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
@@ -1906,7 +1996,7 @@ adminRouter.post("/shipments/:id/documents", async (req, res) => {
 
   try {
     const doc = await attachShipmentDocument({
-      shipmentId: req.params.id,
+      shipmentId: param(req, "id"),
       kind: body.data.kind,
       name: body.data.name,
       url: body.data.url,
@@ -1918,7 +2008,7 @@ adminRouter.post("/shipments/:id/documents", async (req, res) => {
         action: "shipment.document.add",
         entity: "ShipmentDocument",
         entityId: doc.id,
-        meta: { shipmentId: req.params.id, kind: body.data.kind, name: body.data.name },
+        meta: { shipmentId: param(req, "id"), kind: body.data.kind, name: body.data.name },
       },
     });
     return ok(res, serialize(doc), 201);
@@ -1931,14 +2021,14 @@ adminRouter.post("/shipments/:id/documents", async (req, res) => {
 
 adminRouter.delete("/shipments/:id/documents/:docId", async (req, res) => {
   try {
-    await removeShipmentDocument({ shipmentId: req.params.id, documentId: req.params.docId });
+    await removeShipmentDocument({ shipmentId: param(req, "id"), documentId: param(req, "docId") });
     await prisma.auditLog.create({
       data: {
         actorId: req.user!.id,
         action: "shipment.document.remove",
         entity: "ShipmentDocument",
-        entityId: req.params.docId,
-        meta: { shipmentId: req.params.id },
+        entityId: param(req, "docId"),
+        meta: { shipmentId: param(req, "id") },
       },
     });
     return ok(res, serialize({ ok: true }));
@@ -1964,7 +2054,7 @@ adminRouter.get("/records", async (req, res) => {
 
 adminRouter.get("/records/:id", async (req, res) => {
   await seedAdminRecords().catch(() => {});
-  const row = await getAdminRecord(req.params.id);
+  const row = await getAdminRecord(param(req, "id"));
   if (!row) return fail(res, 404, "NOT_FOUND", "Record not found");
   return ok(res, serialize(row));
 });
@@ -1995,9 +2085,9 @@ adminRouter.patch("/records/:id", async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
-  const existing = await getAdminRecord(req.params.id);
+  const existing = await getAdminRecord(param(req, "id"));
   if (!existing) return fail(res, 404, "NOT_FOUND", "Record not found");
-  const row = await patchAdminRecord(req.params.id, body.data);
+  const row = await patchAdminRecord(param(req, "id"), body.data);
   return ok(res, serialize(row));
 });
 

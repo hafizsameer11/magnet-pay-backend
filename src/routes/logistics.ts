@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param } from "../lib/http.js";
 import {
   formatMoney,
   lockToHold,
@@ -30,7 +30,7 @@ logisticsRouter.get("/hs-codes", requireAuth, async (req, res) => {
 });
 
 logisticsRouter.get("/hs-codes/:code", requireAuth, async (req, res) => {
-  const row = getHsCode(req.params.code);
+  const row = getHsCode(param(req, "code"));
   if (!row) return fail(res, 404, "NOT_FOUND", "HS code not found");
   const destination = typeof req.query.destination === "string" ? req.query.destination : "NG";
   return ok(res, serialize({ ...row, dutyPct: dutyPctForDestination(row, destination) }));
@@ -76,7 +76,7 @@ logisticsRouter.post("/estimate", requireAuth, async (req, res) => {
 });
 
 logisticsRouter.get("/orders/:orderId/parcel-type-suggestion", requireAuth, async (req, res) => {
-  const suggestion = await inferParcelTypeForOrder(req.params.orderId, req.user!.id);
+  const suggestion = await inferParcelTypeForOrder(param(req, "orderId"), req.user!.id);
   if (!suggestion) return fail(res, 404, "NOT_FOUND", "Order not found or has no items");
   return ok(res, serialize(suggestion));
 });
@@ -162,7 +162,7 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
 
 logisticsRouter.get("/quote-requests/:requestId/quotes", requireAuth, async (req, res) => {
   const request = await prisma.shippingQuoteRequest.findFirst({
-    where: { id: req.params.requestId, userId: req.user!.id },
+    where: { id: param(req, "requestId"), userId: req.user!.id },
   });
   if (!request) return fail(res, 404, "NOT_FOUND", "Quote request not found");
 
@@ -213,7 +213,7 @@ logisticsRouter.get("/quotes/pending", requireAuth, async (req, res) => {
 
 logisticsRouter.get("/quotes/:id", requireAuth, async (req, res) => {
   const quote = await prisma.shippingQuote.findUnique({
-    where: { id: req.params.id },
+    where: { id: param(req, "id") },
     include: { request: true, partner: true },
   });
   if (!quote || quote.request.userId !== req.user!.id) {
@@ -247,7 +247,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
     })
     .safeParse(req.body ?? {});
   const quote = await prisma.shippingQuote.findUnique({
-    where: { id: req.params.quoteId },
+    where: { id: param(req, "quoteId") },
     include: { request: true, shipment: true },
   });
   if (!quote || quote.request.userId !== req.user!.id) {
@@ -376,7 +376,7 @@ logisticsRouter.get("/shipments", requireAuth, async (req, res) => {
 
 logisticsRouter.get("/shipments/:id", requireAuth, async (req, res) => {
   const row = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
     include: {
       hold: true,
       settlement: true,
@@ -401,7 +401,7 @@ logisticsRouter.post("/shipments/:id/advance", requireAuth, async (req, res) => 
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid status");
   try {
     const updated = await advanceShipmentOps({
-      shipmentId: req.params.id,
+      shipmentId: param(req, "id"),
       userId: req.user!.id,
       status: body.data.status,
       message: body.data.message,
@@ -423,7 +423,7 @@ logisticsRouter.post("/shipments/:id/settle", requireAuth, async (_req, res) => 
 
 logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
   const shipment = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id, status: "TOP_UP_REQUIRED" },
+    where: { id: param(req, "id"), userId: req.user!.id, status: "TOP_UP_REQUIRED" },
     include: { settlement: true },
   });
   if (!shipment?.settlement || shipment.settlement.topUpMinor <= 0n) {
@@ -485,7 +485,7 @@ logisticsRouter.post("/shipments/:id/claim", requireAuth, async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid claim");
-  const id = String(req.params.id);
+  const id = String(param(req, "id"));
   const shipment = await prisma.shipment.findFirst({
     where: { id, userId: req.user!.id },
   });
@@ -523,7 +523,7 @@ logisticsRouter.post("/shipments/:id/claim", requireAuth, async (req, res) => {
 
 logisticsRouter.get("/shipments/:id/claims", requireAuth, async (req, res) => {
   const shipment = await prisma.shipment.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!shipment) return fail(res, 404, "NOT_FOUND", "Shipment not found");
   const claims = await prisma.shipmentClaim.findMany({
@@ -540,7 +540,7 @@ logisticsRouter.post("/shipments/:id/documents", requireAuth, async (req, res) =
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
   try {
     const doc = await attachShipmentDocument({
-      shipmentId: String(req.params.id),
+      shipmentId: String(param(req, "id")),
       userId: req.user!.id,
       kind: body.data.kind,
       name: body.data.name,

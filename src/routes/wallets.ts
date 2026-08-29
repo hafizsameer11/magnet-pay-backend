@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Currency } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, requireAuth, serialize } from "../lib/http.js";
+import {fail, ok, requireAuth, serialize, param } from "../lib/http.js";
 import {
   creditWallet,
   debitWallet,
@@ -66,7 +66,7 @@ walletsRouter.get("/statement", requireAuth, async (req, res) => {
 
 walletsRouter.get("/transactions/:id", requireAuth, async (req, res) => {
   const row = await prisma.transaction.findFirst({
-    where: { id: req.params.id, userId: req.user!.id },
+    where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Transaction not found");
   return ok(res, serialize(row));

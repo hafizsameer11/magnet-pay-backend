@@ -1,7 +1,7 @@
 import type { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
-import { fail, ok, serialize } from "../lib/http.js";
+import {fail, ok, serialize, param } from "../lib/http.js";
 import {
   getAdminAnalyticsGmv,
   getAdminAnalyticsUsers,
@@ -35,10 +35,10 @@ export function registerAdminExtensions(router: Router) {
   router.get("/analytics/cohorts", async (_req, res) => ok(res, serialize(await getAdminAnalyticsCohorts())));
 
   router.get("/products/:id/stats", async (req, res) => {
-    const product = await prisma.product.findUnique({ where: { id: req.params.id } });
+    const product = await prisma.product.findUnique({ where: { id: param(req, "id") } });
     if (!product) return fail(res, 404, "NOT_FOUND", "Product not found");
-    await ensureProductViewEstimate(req.params.id);
-    return ok(res, serialize(await getProductStats(req.params.id)));
+    await ensureProductViewEstimate(param(req, "id"));
+    return ok(res, serialize(await getProductStats(param(req, "id"))));
   });
 
   router.get("/brands", async (_req, res) => {
@@ -70,7 +70,7 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/orders/:id/notes", async (req, res) => {
     const rows = await prisma.orderNote.findMany({
-      where: { orderId: req.params.id },
+      where: { orderId: param(req, "id") },
       include: { author: { select: userSelect } },
       orderBy: { createdAt: "desc" },
     });
@@ -80,7 +80,7 @@ export function registerAdminExtensions(router: Router) {
   router.post("/orders/:id/notes", async (req, res) => {
     const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "body required");
-    const order = await prisma.marketOrder.findUnique({ where: { id: req.params.id } });
+    const order = await prisma.marketOrder.findUnique({ where: { id: param(req, "id") } });
     if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
     const row = await prisma.orderNote.create({
       data: { orderId: order.id, authorId: req.user!.id, body: body.data.body },
@@ -92,7 +92,7 @@ export function registerAdminExtensions(router: Router) {
   router.post("/orders/:id/refund", async (req, res) => {
     const body = z.object({ amountMinor: z.union([z.string(), z.number()]).optional(), reason: z.string().optional() }).safeParse(req.body ?? {});
     if (!body.success) return fail(res, 400, "VALIDATION", "Invalid payload");
-    const order = await prisma.marketOrder.findUnique({ where: { id: req.params.id } });
+    const order = await prisma.marketOrder.findUnique({ where: { id: param(req, "id") } });
     if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
     const updated = await prisma.marketOrder.update({
       where: { id: order.id },
@@ -112,7 +112,7 @@ export function registerAdminExtensions(router: Router) {
   });
 
   router.get("/sellers/:id/stats", async (req, res) => {
-    const stats = await getSellerStats(req.params.id);
+    const stats = await getSellerStats(param(req, "id"));
     if (!stats) return fail(res, 404, "NOT_FOUND", "Seller not found");
     return ok(res, serialize(stats));
   });
@@ -134,9 +134,9 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/wallets/:userId/stats", async (req, res) => {
     const since30 = new Date(Date.now() - 30 * 86_400_000);
-    const wallets = await prisma.wallet.findMany({ where: { userId: req.params.userId } });
+    const wallets = await prisma.wallet.findMany({ where: { userId: param(req, "userId") } });
     const txns = await prisma.transaction.count({
-      where: { userId: req.params.userId, createdAt: { gte: since30 } },
+      where: { userId: param(req, "userId"), createdAt: { gte: since30 } },
     });
     return ok(res, serialize({ wallets: wallets.length, txns30d: txns }));
   });
@@ -182,7 +182,7 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/disputes/:id", async (req, res) => {
     const row = await prisma.dispute.findUnique({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       include: {
         escrow: { include: { milestones: true, buyer: { select: userSelect }, seller: { select: userSelect } } },
         openedBy: { select: userSelect },
@@ -204,10 +204,10 @@ export function registerAdminExtensions(router: Router) {
       })
       .safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "Invalid payload");
-    const existing = await prisma.dispute.findUnique({ where: { id: req.params.id } });
+    const existing = await prisma.dispute.findUnique({ where: { id: param(req, "id") } });
     if (!existing) return fail(res, 404, "NOT_FOUND", "Dispute not found");
     const row = await prisma.dispute.update({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       data: {
         ...(body.data.status !== undefined ? { status: body.data.status } : {}),
         ...(body.data.assigneeId !== undefined ? { assigneeId: body.data.assigneeId } : {}),
@@ -226,12 +226,19 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/tickets", async (req, res) => {
     const status = typeof req.query.status === "string" ? req.query.status : undefined;
-    const rows = await listAdminRecords("ticket", status);
+    const userId = typeof req.query.userId === "string" ? req.query.userId : undefined;
+    let rows = await listAdminRecords("ticket", status);
+    if (userId) {
+      rows = rows.filter((r) => {
+        const p = (r.payload ?? {}) as Record<string, unknown>;
+        return p.userId === userId;
+      });
+    }
     return ok(res, serialize(rows));
   });
 
   router.get("/tickets/:id", async (req, res) => {
-    const row = await getAdminRecord(req.params.id);
+    const row = await getAdminRecord(param(req, "id"));
     if (!row || row.domain !== "ticket") return fail(res, 404, "NOT_FOUND", "Ticket not found");
     return ok(res, serialize(row));
   });
@@ -239,18 +246,81 @@ export function registerAdminExtensions(router: Router) {
   router.post("/tickets/:id/messages", async (req, res) => {
     const body = z.object({ body: z.string().min(1), author: z.string().optional() }).safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "body required");
-    const row = await getAdminRecord(req.params.id);
+    const row = await getAdminRecord(param(req, "id"));
     if (!row || row.domain !== "ticket") return fail(res, 404, "NOT_FOUND", "Ticket not found");
     const payload = (row.payload ?? {}) as Record<string, unknown>;
     const messages = Array.isArray(payload.messages) ? [...payload.messages] : [];
+    const authorName = body.data.author ?? req.user!.id;
     messages.push({
       id: `msg-${Date.now()}`,
       body: body.data.body,
       author: body.data.author ?? "Admin",
       at: new Date().toISOString(),
     });
+    const conversationId = typeof payload.conversationId === "string" ? payload.conversationId : null;
+    if (conversationId) {
+      const conv = await prisma.conversation.findUnique({ where: { id: conversationId } });
+      if (conv) {
+        const part = await prisma.conversationParticipant.findFirst({
+          where: { conversationId, userId: req.user!.id },
+        });
+        if (!part) {
+          await prisma.conversationParticipant.create({
+            data: { conversationId, userId: req.user!.id },
+          });
+        }
+        await prisma.message.create({
+          data: {
+            conversationId,
+            senderId: req.user!.id,
+            body: `[Support] ${body.data.body}`,
+          },
+        });
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { updatedAt: new Date() },
+        });
+      }
+    }
     const updated = await patchAdminRecord(row.id, { payload: { ...payload, messages } });
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "ticket.reply",
+        entity: "AdminRecord",
+        entityId: row.id,
+        meta: { author: authorName, conversationId },
+      },
+    }).catch(() => {});
     return ok(res, serialize(updated));
+  });
+
+  router.post("/conversations/:id/messages", async (req, res) => {
+    const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
+    if (!body.success) return fail(res, 400, "VALIDATION", "body required");
+    const conversationId = param(req, "id");
+    const conv = await prisma.conversation.findUnique({ where: { id: conversationId } });
+    if (!conv) return fail(res, 404, "NOT_FOUND", "Conversation not found");
+    const part = await prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId: req.user!.id },
+    });
+    if (!part) {
+      await prisma.conversationParticipant.create({
+        data: { conversationId, userId: req.user!.id },
+      });
+    }
+    const msg = await prisma.message.create({
+      data: {
+        conversationId,
+        senderId: req.user!.id,
+        body: body.data.body,
+      },
+    });
+    await prisma.conversation.update({
+      where: { id: conversationId },
+      data: { updatedAt: new Date() },
+    });
+    return ok(res, serialize(msg), 201);
   });
 
   const domainGet = (path: string, domain: string) => {
@@ -270,7 +340,7 @@ export function registerAdminExtensions(router: Router) {
   domainGet("/sms-templates", "sms-template");
 
   router.get("/compliance/aml/:id", async (req, res) => {
-    const row = await getAdminRecord(req.params.id);
+    const row = await getAdminRecord(param(req, "id"));
     if (!row || row.domain !== "aml") return fail(res, 404, "NOT_FOUND", "Case not found");
     return ok(res, serialize(row));
   });
@@ -278,7 +348,7 @@ export function registerAdminExtensions(router: Router) {
   router.post("/compliance/aml/:id/decide", async (req, res) => {
     const body = z.object({ status: z.string(), note: z.string().optional() }).safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "status required");
-    const row = await patchAdminRecord(req.params.id, {
+    const row = await patchAdminRecord(param(req, "id"), {
       status: body.data.status,
       payload: { note: body.data.note },
     });
@@ -288,7 +358,7 @@ export function registerAdminExtensions(router: Router) {
   router.post("/compliance/fraud-cases/:id/decide", async (req, res) => {
     const body = z.object({ status: z.string(), note: z.string().optional() }).safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "status required");
-    const row = await patchAdminRecord(req.params.id, {
+    const row = await patchAdminRecord(param(req, "id"), {
       status: body.data.status,
       payload: { note: body.data.note },
     });
@@ -297,7 +367,7 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/categories/:id", async (req, res) => {
     const row = await prisma.category.findUnique({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       include: { _count: { select: { products: true } }, defaultParcelType: { select: { id: true, code: true, name: true } } },
     });
     if (!row) return fail(res, 404, "NOT_FOUND", "Category not found");
@@ -306,7 +376,7 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/reviews/:id", async (req, res) => {
     const row = await prisma.review.findUnique({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       include: {
         user: { select: userSelect },
         product: { select: { id: true, title: true, storeId: true } },
@@ -318,7 +388,7 @@ export function registerAdminExtensions(router: Router) {
 
   router.get("/conversations/:id", async (req, res) => {
     const row = await prisma.conversation.findUnique({
-      where: { id: req.params.id },
+      where: { id: param(req, "id") },
       include: {
         participants: { include: { user: { select: userSelect } } },
         messages: { orderBy: { createdAt: "asc" }, take: 100 },
@@ -329,10 +399,10 @@ export function registerAdminExtensions(router: Router) {
   });
 
   router.get("/users/:id/notes", async (req, res) => {
-    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    const user = await prisma.user.findUnique({ where: { id: param(req, "id") } });
     if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
     const rows = await prisma.auditLog.findMany({
-      where: { entity: "User", entityId: req.params.id, action: "user.admin_note" },
+      where: { entity: "User", entityId: param(req, "id"), action: "user.admin_note" },
       include: { actor: { select: userSelect } },
       orderBy: { createdAt: "desc" },
       take: 100,
@@ -353,7 +423,7 @@ export function registerAdminExtensions(router: Router) {
   router.post("/users/:id/notes", async (req, res) => {
     const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
     if (!body.success) return fail(res, 400, "VALIDATION", "body required");
-    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    const user = await prisma.user.findUnique({ where: { id: param(req, "id") } });
     if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
     const row = await prisma.auditLog.create({
       data: {
