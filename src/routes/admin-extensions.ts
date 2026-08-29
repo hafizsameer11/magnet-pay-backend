@@ -294,4 +294,114 @@ export function registerAdminExtensions(router: Router) {
     });
     return ok(res, serialize(row));
   });
+
+  router.get("/categories/:id", async (req, res) => {
+    const row = await prisma.category.findUnique({
+      where: { id: req.params.id },
+      include: { _count: { select: { products: true } }, defaultParcelType: { select: { id: true, code: true, name: true } } },
+    });
+    if (!row) return fail(res, 404, "NOT_FOUND", "Category not found");
+    return ok(res, serialize(row));
+  });
+
+  router.get("/reviews/:id", async (req, res) => {
+    const row = await prisma.review.findUnique({
+      where: { id: req.params.id },
+      include: {
+        user: { select: userSelect },
+        product: { select: { id: true, title: true, storeId: true } },
+      },
+    });
+    if (!row) return fail(res, 404, "NOT_FOUND", "Review not found");
+    return ok(res, serialize(row));
+  });
+
+  router.get("/conversations/:id", async (req, res) => {
+    const row = await prisma.conversation.findUnique({
+      where: { id: req.params.id },
+      include: {
+        participants: { include: { user: { select: userSelect } } },
+        messages: { orderBy: { createdAt: "asc" }, take: 100 },
+      },
+    });
+    if (!row) return fail(res, 404, "NOT_FOUND", "Conversation not found");
+    return ok(res, serialize(row));
+  });
+
+  router.get("/users/:id/notes", async (req, res) => {
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+    const rows = await prisma.auditLog.findMany({
+      where: { entity: "User", entityId: req.params.id, action: "user.admin_note" },
+      include: { actor: { select: userSelect } },
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    });
+    return ok(
+      res,
+      serialize(
+        rows.map((r) => ({
+          id: r.id,
+          body: ((r.meta ?? {}) as { body?: string }).body ?? "",
+          createdAt: r.createdAt,
+          author: r.actor,
+        })),
+      ),
+    );
+  });
+
+  router.post("/users/:id/notes", async (req, res) => {
+    const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
+    if (!body.success) return fail(res, 400, "VALIDATION", "body required");
+    const user = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+    const row = await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "user.admin_note",
+        entity: "User",
+        entityId: user.id,
+        meta: { body: body.data.body },
+      },
+      include: { actor: { select: userSelect } },
+    });
+    return ok(
+      res,
+      serialize({
+        id: row.id,
+        body: body.data.body,
+        createdAt: row.createdAt,
+        author: row.actor,
+      }),
+      201,
+    );
+  });
+
+  router.get("/export/orders.csv", async (_req, res) => {
+    const rows = await prisma.marketOrder.findMany({
+      include: { user: { select: userSelect }, items: true },
+      orderBy: { createdAt: "desc" },
+      take: 5000,
+    });
+    const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    const header = ["id", "createdAt", "status", "currency", "totalMinor", "buyerName", "buyerPhone", "itemCount", "logisticsStatus"].join(",");
+    const lines = rows.map((o) =>
+      [
+        o.id,
+        o.createdAt.toISOString(),
+        o.status,
+        o.currency,
+        o.totalMinor.toString(),
+        o.user?.name ?? "",
+        o.user?.phone ?? "",
+        o.items.length,
+        o.logisticsStatus ?? "",
+      ]
+        .map((v) => escape(String(v)))
+        .join(","),
+    );
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="magnetpay-orders-${new Date().toISOString().slice(0, 10)}.csv"`);
+    return res.send([header, ...lines].join("\n"));
+  });
 }
