@@ -743,6 +743,48 @@ adminRouter.patch("/users/:id", async (req, res) => {
   );
 });
 
+adminRouter.post("/users/:id/open-chat", async (req, res) => {
+  const targetUserId = param(req, "id");
+  const adminId = req.user!.id;
+  const target = await prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true, name: true } });
+  if (!target) return fail(res, 404, "NOT_FOUND", "User not found");
+
+  const adminConversations = await prisma.conversationParticipant.findMany({
+    where: { userId: adminId },
+    select: { conversationId: true },
+  });
+  const existing = await prisma.conversationParticipant.findFirst({
+    where: {
+      userId: targetUserId,
+      conversationId: { in: adminConversations.map((p) => p.conversationId) },
+    },
+    select: { conversationId: true },
+  });
+
+  if (existing) {
+    return ok(res, serialize({ conversationId: existing.conversationId, created: false }));
+  }
+
+  const conv = await prisma.conversation.create({
+    data: {
+      subject: `Support · ${target.name}`,
+      participants: {
+        create: [{ userId: adminId }, { userId: targetUserId }],
+      },
+    },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: adminId,
+      action: "chat.open",
+      entity: "Conversation",
+      entityId: conv.id,
+      meta: { targetUserId },
+    },
+  });
+  return ok(res, serialize({ conversationId: conv.id, created: true }), 201);
+});
+
 adminRouter.get("/deposits", async (_req, res) => {
   const rows = await prisma.deposit.findMany({
     include: { user: { select: userSelect } },
