@@ -89,6 +89,7 @@ async function main() {
   await prisma.user.deleteMany();
   await prisma.fxRate.deleteMany();
   await prisma.feeConfig.deleteMany();
+  await prisma.logisticsPartnerRate.deleteMany();
   await prisma.logisticsPartner.deleteMany();
   await prisma.freightPricing.deleteMany();
   await prisma.complianceLimits.deleteMany();
@@ -257,9 +258,69 @@ async function main() {
         code: "PACIFIC",
         kind: "FREIGHT_FORWARDER",
         modes: ["SEA", "EXPRESS"],
-        active: false,
+        active: true,
         rating: 4.8,
         serviceLabel: "Express sea lane",
+      },
+      {
+        name: "Maersk Consolidated",
+        code: "MAERSK",
+        kind: "FREIGHT_FORWARDER",
+        modes: ["SEA", "CONSOLIDATED"],
+        active: true,
+        rating: 4.5,
+        serviceLabel: "Port-to-port · bulk",
+      },
+    ],
+  });
+
+  const partnerRows = await prisma.logisticsPartner.findMany();
+  const partnerByCode = Object.fromEntries(partnerRows.map((p) => [p.code, p.id]));
+  await prisma.logisticsPartnerRate.createMany({
+    data: [
+      {
+        id: "rate-magnet-sea",
+        partnerId: partnerByCode.MAGNET!,
+        mode: "SEA",
+        rateMultiplierBps: 10000,
+        etaLabel: "26–32 days",
+        badgeLabel: "Best value",
+        includes: ["Insurance", "Customs paperwork"],
+        ecoFriendly: true,
+        sortOrder: 0,
+      },
+      {
+        id: "rate-chinasea-sea",
+        partnerId: partnerByCode.CHINASEA!,
+        mode: "SEA",
+        rateMultiplierBps: 10000,
+        etaLabel: "26–32 days",
+        badgeLabel: "Best value",
+        includes: ["Insurance", "Customs paperwork"],
+        ecoFriendly: true,
+        sortOrder: 1,
+      },
+      {
+        id: "rate-pacific-sea",
+        partnerId: partnerByCode.PACIFIC!,
+        mode: "SEA",
+        rateMultiplierBps: 12700,
+        baseSurchargeMinor: 0,
+        etaLabel: "22–26 days",
+        badgeLabel: "Fastest sea",
+        includes: ["Priority handling", "Insurance"],
+        sortOrder: 2,
+      },
+      {
+        id: "rate-maersk-sea",
+        partnerId: partnerByCode.MAERSK!,
+        mode: "SEA",
+        rateMultiplierBps: 24500,
+        etaLabel: "28–34 days",
+        badgeLabel: "Best for bulk",
+        includes: ["Insurance"],
+        ecoFriendly: true,
+        sortOrder: 3,
       },
     ],
   });

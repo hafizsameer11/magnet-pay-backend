@@ -30,6 +30,7 @@ const productShippingSchema = {
   leadTimeMax: z.number().int().nonnegative().optional(),
   packagingType: z.string().min(1).optional(),
   defaultIncoterm: z.string().min(2).optional(),
+  parcelTypeId: z.string().uuid().optional().nullable(),
 };
 
 function orderLogisticsNextAction(order: {
@@ -268,6 +269,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
         ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
         ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
+        ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
       },
     });
     const urls = body.data.mediaUrls ?? (body.data.imageUrl ? [body.data.imageUrl] : []);
@@ -287,7 +289,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
     }
     return tx.product.findUnique({
       where: { id: p.id },
-      include: { media: true, category: true, store: true, variants: { where: { active: true } } },
+      include: { media: true, category: true, store: true, variants: { where: { active: true } }, parcelType: true },
     });
   });
   return ok(res, serialize(product), 201);
@@ -339,6 +341,7 @@ marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
         ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
         ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
         ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
+        ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
       },
     });
     if (body.data.mediaUrls) {

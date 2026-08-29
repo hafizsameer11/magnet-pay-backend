@@ -10,7 +10,9 @@ import {
 } from "../services/ledger.js";
 import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-codes.js";
 import { notifyUserEmail } from "../services/notify.js";
-import { estimateQuoteMinor } from "../services/freight-pricing.js";
+import { estimateQuoteFromParcelType, estimateQuoteMinor, getLogisticsEstimateConfig, listActiveParcelTypes } from "../services/freight-pricing.js";
+import { generatePartnerQuotes, serializeQuoteForCompare } from "../services/partner-quotes.js";
+import { inferParcelTypeForOrder } from "../services/parcel-type-infer.js";
 import { advanceShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 import { mergeSellerDocsIntoBooking } from "../services/order-docs.js";
@@ -34,9 +36,50 @@ logisticsRouter.get("/hs-codes/:code", requireAuth, async (req, res) => {
   return ok(res, serialize({ ...row, dutyPct: dutyPctForDestination(row, destination) }));
 });
 
-function estimateMinor(cbm: number, weightKg: number, mode: string): Promise<bigint> {
-  return estimateQuoteMinor(cbm, weightKg, mode);
+function estimateMinor(parcelTypeId: string, weightKg: number, declaredUsd?: number): Promise<bigint> {
+  return estimateQuoteMinor(parcelTypeId, weightKg, "SEA", declaredUsd);
 }
+
+logisticsRouter.get("/parcel-types", requireAuth, async (_req, res) => {
+  const rows = await listActiveParcelTypes();
+  return ok(res, serialize(rows));
+});
+
+logisticsRouter.get("/estimate-config", requireAuth, async (_req, res) => {
+  const config = await getLogisticsEstimateConfig();
+  return ok(res, serialize(config));
+});
+
+logisticsRouter.post("/estimate", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      parcelTypeId: z.string().min(1),
+      weightKg: z.number().positive(),
+      declaredUsd: z.number().nonnegative().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid estimate request");
+  try {
+    const breakdown = await estimateQuoteFromParcelType(body.data);
+    const config = await getLogisticsEstimateConfig();
+    return ok(
+      res,
+      serialize({
+        ...breakdown,
+        disclaimer: config.estimateDisclaimer,
+        usdNgnEstimateRate: config.usdNgnEstimateRate,
+      }),
+    );
+  } catch (e) {
+    return fail(res, 400, "ESTIMATE_FAILED", e instanceof Error ? e.message : "Estimate failed");
+  }
+});
+
+logisticsRouter.get("/orders/:orderId/parcel-type-suggestion", requireAuth, async (req, res) => {
+  const suggestion = await inferParcelTypeForOrder(req.params.orderId, req.user!.id);
+  if (!suggestion) return fail(res, 404, "NOT_FOUND", "Order not found or has no items");
+  return ok(res, serialize(suggestion));
+});
 
 logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
   const body = z
@@ -47,8 +90,10 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
       origin: z.string().min(2),
       destination: z.string().min(2),
       mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).default("SEA"),
+      parcelTypeId: z.string().min(1),
       orderId: z.string().uuid().optional(),
       destinationDelivery: z.enum(["PICKUP", "DOORSTEP"]).optional(),
+      declaredUsd: z.number().nonnegative().optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid quote request");
@@ -60,7 +105,17 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
     if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   }
 
-  const estimatedMinor = await estimateMinor(body.data.cbm, body.data.weightKg, body.data.mode);
+  let baseBreakdown;
+  try {
+    baseBreakdown = await estimateQuoteFromParcelType({
+      parcelTypeId: body.data.parcelTypeId,
+      weightKg: body.data.weightKg,
+      declaredUsd: body.data.declaredUsd,
+    });
+  } catch (e) {
+    return fail(res, 400, "INVALID_PARCEL_TYPE", e instanceof Error ? e.message : "Invalid parcel type");
+  }
+
   const result = await prisma.$transaction(async (tx) => {
     const request = await tx.shippingQuoteRequest.create({
       data: {
@@ -71,16 +126,9 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
         origin: body.data.origin,
         destination: body.data.destination,
         mode: body.data.mode,
+        parcelTypeId: body.data.parcelTypeId,
         orderId: body.data.orderId ?? null,
         destinationDelivery: body.data.destinationDelivery ?? null,
-      },
-    });
-    const quote = await tx.shippingQuote.create({
-      data: {
-        requestId: request.id,
-        estimatedMinor,
-        currency: "NGN",
-        validUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       },
     });
     if (body.data.orderId) {
@@ -89,9 +137,48 @@ logisticsRouter.post("/quotes", requireAuth, async (req, res) => {
         data: { logisticsStatus: "QUOTE_PENDING" },
       });
     }
-    return { request, quote };
+    return { request, baseBreakdown };
   });
-  return ok(res, serialize(result), 201);
+
+  const quotes = await generatePartnerQuotes({
+    requestId: result.request.id,
+    parcelTypeId: body.data.parcelTypeId,
+    weightKg: body.data.weightKg,
+    mode: body.data.mode,
+    declaredUsd: body.data.declaredUsd,
+  });
+
+  return ok(
+    res,
+    serialize({
+      request: result.request,
+      quotes: quotes.map((q) => serializeQuoteForCompare(q, result.request)),
+      quote: quotes[0] ?? null,
+      baseEstimate: result.baseBreakdown,
+    }),
+    201,
+  );
+});
+
+logisticsRouter.get("/quote-requests/:requestId/quotes", requireAuth, async (req, res) => {
+  const request = await prisma.shippingQuoteRequest.findFirst({
+    where: { id: req.params.requestId, userId: req.user!.id },
+  });
+  if (!request) return fail(res, 404, "NOT_FOUND", "Quote request not found");
+
+  const quotes = await prisma.shippingQuote.findMany({
+    where: { requestId: request.id, shipment: null, validUntil: { gt: new Date() } },
+    include: { partner: true },
+    orderBy: { estimatedMinor: "asc" },
+  });
+
+  return ok(
+    res,
+    serialize({
+      request,
+      quotes: quotes.map((q) => serializeQuoteForCompare(q, request)),
+    }),
+  );
 });
 
 logisticsRouter.get("/quotes/pending", requireAuth, async (req, res) => {
@@ -102,33 +189,37 @@ logisticsRouter.get("/quotes/pending", requireAuth, async (req, res) => {
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
 
-  const quote = await prisma.shippingQuote.findFirst({
+  const quotes = await prisma.shippingQuote.findMany({
     where: {
       request: { orderId, userId: req.user!.id },
       shipment: null,
       validUntil: { gt: new Date() },
     },
-    include: { request: true },
-    orderBy: { createdAt: "desc" },
+    include: { partner: true, request: true },
+    orderBy: { estimatedMinor: "asc" },
   });
-  if (!quote) return ok(res, null);
+  if (!quotes.length) return ok(res, null);
 
-  const mode = quote.request.mode;
-  const eta = mode === "AIR" ? "7–12 days" : mode === "EXPRESS" ? "5–8 days" : "26–32 days";
-  return ok(res, serialize({ ...quote, eta, rating: 4.7, includes: ["Insurance", "Customs paperwork"] }));
+  const quote = quotes[0]!;
+  return ok(
+    res,
+    serialize({
+      ...serializeQuoteForCompare(quote, quote.request),
+      requestId: quote.requestId,
+      allQuotes: quotes.map((q) => serializeQuoteForCompare(q, quote.request)),
+    }),
+  );
 });
 
 logisticsRouter.get("/quotes/:id", requireAuth, async (req, res) => {
   const quote = await prisma.shippingQuote.findUnique({
     where: { id: req.params.id },
-    include: { request: true },
+    include: { request: true, partner: true },
   });
   if (!quote || quote.request.userId !== req.user!.id) {
     return fail(res, 404, "NOT_FOUND", "Quote not found");
   }
-  const mode = quote.request.mode;
-  const eta = mode === "AIR" ? "7–12 days" : mode === "EXPRESS" ? "5–8 days" : "26–32 days";
-  return ok(res, serialize({ ...quote, eta, rating: 4.7, includes: ["Insurance", "Customs paperwork"] }));
+  return ok(res, serialize(serializeQuoteForCompare(quote, quote.request)));
 });
 
 function computeShipmentEta(mode: string): string {
@@ -190,7 +281,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
           route: `${quote.request.origin} → ${quote.request.destination}`,
           mode: quote.request.mode,
           status: "HOLD_LOCKED",
-          eta: computeShipmentEta(quote.request.mode),
+          eta: quote.etaLabel ?? computeShipmentEta(quote.request.mode),
         },
       });
       await tx.shipmentHold.create({
@@ -340,11 +431,12 @@ logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
   }
   try {
     const updated = await prisma.$transaction(async (tx) => {
+      const topUpAmount = shipment.settlement!.topUpMinor;
       await debitWallet(
         tx,
         req.user!.id,
         shipment.settlement!.currency,
-        shipment.settlement!.topUpMinor,
+        topUpAmount,
         `Logistics top-up ${shipment.ref}`,
       );
       await recordTx(tx, {
@@ -352,12 +444,24 @@ logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
         kind: "logistics_topup",
         title: `Top-up ${shipment.ref}`,
         currency: shipment.settlement!.currency,
-        amountDisplay: `−${formatMoney(shipment.settlement!.currency, shipment.settlement!.topUpMinor)}`,
+        amountDisplay: `−${formatMoney(shipment.settlement!.currency, topUpAmount)}`,
         amountPositive: false,
         icon: "ship",
       });
+      await tx.shipmentSettlement.update({
+        where: { id: shipment.settlement!.id },
+        data: { topUpMinor: 0n },
+      });
       await tx.shipmentEvent.create({
         data: { shipmentId: shipment.id, status: "READY_FOR_POD", message: "Top-up paid" },
+      });
+      await tx.notification.create({
+        data: {
+          userId: req.user!.id,
+          title: "Top-up received",
+          body: `You can now confirm delivery for ${shipment.ref}.`,
+          href: `/logistics/shipments/${shipment.id}`,
+        },
       });
       return tx.shipment.update({
         where: { id: shipment.id },

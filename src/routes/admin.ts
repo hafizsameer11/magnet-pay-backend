@@ -5,7 +5,15 @@ import { z } from "zod";
 import { deliverUserNotification } from "../services/deliver.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
-import { getFreightPricing, estimateFreightMinor, DEFAULT_FREIGHT_PRICING } from "../services/freight-pricing.js";
+import {
+  getFreightPricing,
+  estimateFreightMinor,
+  estimateQuoteFromParcelType,
+  getLogisticsEstimateConfig,
+  listActiveParcelTypes,
+  DEFAULT_FREIGHT_PRICING,
+  DEFAULT_ESTIMATE_DISCLAIMER,
+} from "../services/freight-pricing.js";
 import {
   getComplianceLimits,
   updateComplianceLimits,
@@ -1436,20 +1444,30 @@ adminRouter.get("/logistics/pricing", async (_req, res) => {
   return ok(res, serialize(row));
 });
 
-adminRouter.put("/logistics/pricing", async (req, res) => {
+adminRouter.put("/logistics/pricing", async (_req, res) => {
+  return fail(
+    res,
+    410,
+    "DEPRECATED",
+    "Global CBM/weight pricing is deprecated. Use /admin/logistics/parcel-types and /admin/logistics/estimate-config instead.",
+  );
+});
+
+adminRouter.get("/logistics/estimate-config", async (_req, res) => {
+  const row = await getLogisticsEstimateConfig();
+  return ok(res, serialize(row));
+});
+
+adminRouter.put("/logistics/estimate-config", async (req, res) => {
   const body = z
     .object({
-      airBaseMinor: z.number().int().nonnegative(),
-      seaBaseMinor: z.number().int().nonnegative(),
-      expressBaseMinor: z.number().int().nonnegative(),
-      consolidatedBaseMinor: z.number().int().nonnegative(),
-      cbmMultiplier: z.number().int().positive(),
-      weightMultiplier: z.number().int().positive(),
+      usdNgnEstimateRate: z.number().int().positive(),
+      estimateDisclaimer: z.string().min(10),
     })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid freight pricing");
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid estimate config");
 
-  const row = await prisma.freightPricing.upsert({
+  const row = await prisma.logisticsEstimateConfig.upsert({
     where: { id: "default" },
     create: { id: "default", ...body.data },
     update: body.data,
@@ -1457,8 +1475,8 @@ adminRouter.put("/logistics/pricing", async (req, res) => {
   await prisma.auditLog.create({
     data: {
       actorId: req.user!.id,
-      action: "logistics.pricing.update",
-      entity: "FreightPricing",
+      action: "logistics.estimate_config.update",
+      entity: "LogisticsEstimateConfig",
       entityId: row.id,
       meta: body.data,
     },
@@ -1466,25 +1484,97 @@ adminRouter.put("/logistics/pricing", async (req, res) => {
   return ok(res, serialize(row));
 });
 
-adminRouter.post("/logistics/pricing/preview", async (req, res) => {
+adminRouter.get("/logistics/parcel-types", async (_req, res) => {
+  const rows = await prisma.parcelType.findMany({ orderBy: [{ sortOrder: "asc" }, { name: "asc" }] });
+  return ok(res, serialize(rows));
+});
+
+adminRouter.post("/logistics/parcel-types", async (req, res) => {
   const body = z
     .object({
-      cbm: z.number().positive(),
+      code: z.string().min(2).max(32),
+      name: z.string().min(2),
+      baseMinor: z.number().int().nonnegative(),
+      ratePerKgMinor: z.number().int().nonnegative(),
+      active: z.boolean().default(true),
+      sortOrder: z.number().int().default(0),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid parcel type");
+
+  const row = await prisma.parcelType.create({ data: body.data });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "logistics.parcel_type.create",
+      entity: "ParcelType",
+      entityId: row.id,
+      meta: body.data,
+    },
+  });
+  return ok(res, serialize(row), 201);
+});
+
+adminRouter.patch("/logistics/parcel-types/:id", async (req, res) => {
+  const body = z
+    .object({
+      name: z.string().min(2).optional(),
+      baseMinor: z.number().int().nonnegative().optional(),
+      ratePerKgMinor: z.number().int().nonnegative().optional(),
+      active: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid parcel type patch");
+
+  const existing = await prisma.parcelType.findUnique({ where: { id: req.params.id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Parcel type not found");
+
+  const row = await prisma.parcelType.update({ where: { id: req.params.id }, data: body.data });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "logistics.parcel_type.update",
+      entity: "ParcelType",
+      entityId: row.id,
+      meta: body.data,
+    },
+  });
+  return ok(res, serialize(row));
+});
+
+adminRouter.post("/logistics/parcel-types/preview", async (req, res) => {
+  const body = z
+    .object({
+      parcelTypeId: z.string().min(1),
       weightKg: z.number().positive(),
-      mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).default("SEA"),
+      declaredUsd: z.number().nonnegative().optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid preview input");
-  const config = await getFreightPricing();
-  const estimatedMinor = estimateFreightMinor(body.data.cbm, body.data.weightKg, body.data.mode, config);
-  return ok(
-    res,
-    serialize({
-      ...body.data,
-      estimatedMinor,
-      formula: `base(${body.data.mode}) + ceil(cbm×${config.cbmMultiplier}) + ceil(kg×${config.weightMultiplier})`,
-    }),
-  );
+  try {
+    const breakdown = await estimateQuoteFromParcelType(body.data);
+    return ok(res, serialize(breakdown));
+  } catch (e) {
+    return fail(res, 400, "PREVIEW_FAILED", e instanceof Error ? e.message : "Preview failed");
+  }
+});
+
+adminRouter.post("/logistics/pricing/preview", async (req, res) => {
+  const body = z
+    .object({
+      parcelTypeId: z.string().min(1),
+      weightKg: z.number().positive(),
+      declaredUsd: z.number().nonnegative().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid preview input — use parcelTypeId + weightKg");
+  try {
+    const breakdown = await estimateQuoteFromParcelType(body.data);
+    return ok(res, serialize(breakdown));
+  } catch (e) {
+    return fail(res, 400, "PREVIEW_FAILED", e instanceof Error ? e.message : "Preview failed");
+  }
 });
 
 adminRouter.get("/logistics/partners", async (_req, res) => {
@@ -1493,7 +1583,15 @@ adminRouter.get("/logistics/partners", async (_req, res) => {
 });
 
 adminRouter.get("/logistics/partners/:id", async (req, res) => {
-  const row = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  const row = await prisma.logisticsPartner.findUnique({
+    where: { id: req.params.id },
+    include: {
+      rates: {
+        orderBy: [{ sortOrder: "asc" }, { mode: "asc" }],
+        include: { parcelType: { select: { id: true, code: true, name: true } } },
+      },
+    },
+  });
   if (!row) return fail(res, 404, "NOT_FOUND", "Partner not found");
   return ok(res, serialize(row));
 });
@@ -1592,8 +1690,117 @@ adminRouter.patch("/logistics/partners/:id", async (req, res) => {
   return ok(res, serialize(row));
 });
 
+adminRouter.get("/logistics/partners/:id/rates", async (req, res) => {
+  const partner = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return fail(res, 404, "NOT_FOUND", "Partner not found");
+  const rows = await prisma.logisticsPartnerRate.findMany({
+    where: { partnerId: partner.id },
+    include: { parcelType: { select: { id: true, code: true, name: true } } },
+    orderBy: [{ sortOrder: "asc" }, { mode: "asc" }],
+  });
+  return ok(res, serialize(rows));
+});
+
+adminRouter.post("/logistics/partners/:id/rates", async (req, res) => {
+  const partner = await prisma.logisticsPartner.findUnique({ where: { id: req.params.id } });
+  if (!partner) return fail(res, 404, "NOT_FOUND", "Partner not found");
+  const body = z
+    .object({
+      parcelTypeId: z.string().uuid().nullable().optional(),
+      mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).default("SEA"),
+      baseSurchargeMinor: z.number().int().nonnegative().default(0),
+      rateMultiplierBps: z.number().int().positive().default(10000),
+      etaLabel: z.string().min(3).default("26–32 days"),
+      badgeLabel: z.string().nullable().optional(),
+      includes: z.array(z.string()).optional(),
+      ecoFriendly: z.boolean().default(false),
+      active: z.boolean().default(true),
+      sortOrder: z.number().int().default(0),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid rate card");
+
+  const row = await prisma.logisticsPartnerRate.create({
+    data: {
+      partnerId: partner.id,
+      parcelTypeId: body.data.parcelTypeId ?? null,
+      mode: body.data.mode,
+      baseSurchargeMinor: body.data.baseSurchargeMinor,
+      rateMultiplierBps: body.data.rateMultiplierBps,
+      etaLabel: body.data.etaLabel,
+      badgeLabel: body.data.badgeLabel ?? null,
+      includes: body.data.includes ?? ["Insurance", "Customs paperwork"],
+      ecoFriendly: body.data.ecoFriendly,
+      active: body.data.active,
+      sortOrder: body.data.sortOrder,
+    },
+    include: { parcelType: { select: { id: true, code: true, name: true } } },
+  });
+  return ok(res, serialize(row), 201);
+});
+
+adminRouter.patch("/logistics/partners/:partnerId/rates/:rateId", async (req, res) => {
+  const existing = await prisma.logisticsPartnerRate.findFirst({
+    where: { id: req.params.rateId, partnerId: req.params.partnerId },
+  });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Rate not found");
+  const body = z
+    .object({
+      parcelTypeId: z.string().uuid().nullable().optional(),
+      mode: z.enum(["AIR", "SEA", "EXPRESS", "CONSOLIDATED"]).optional(),
+      baseSurchargeMinor: z.number().int().nonnegative().optional(),
+      rateMultiplierBps: z.number().int().positive().optional(),
+      etaLabel: z.string().min(3).optional(),
+      badgeLabel: z.string().nullable().optional(),
+      includes: z.array(z.string()).optional(),
+      ecoFriendly: z.boolean().optional(),
+      active: z.boolean().optional(),
+      sortOrder: z.number().int().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid rate update");
+
+  const row = await prisma.logisticsPartnerRate.update({
+    where: { id: existing.id },
+    data: {
+      ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
+      ...(body.data.mode !== undefined ? { mode: body.data.mode } : {}),
+      ...(body.data.baseSurchargeMinor !== undefined ? { baseSurchargeMinor: body.data.baseSurchargeMinor } : {}),
+      ...(body.data.rateMultiplierBps !== undefined ? { rateMultiplierBps: body.data.rateMultiplierBps } : {}),
+      ...(body.data.etaLabel !== undefined ? { etaLabel: body.data.etaLabel } : {}),
+      ...(body.data.badgeLabel !== undefined ? { badgeLabel: body.data.badgeLabel } : {}),
+      ...(body.data.includes !== undefined ? { includes: body.data.includes } : {}),
+      ...(body.data.ecoFriendly !== undefined ? { ecoFriendly: body.data.ecoFriendly } : {}),
+      ...(body.data.active !== undefined ? { active: body.data.active } : {}),
+      ...(body.data.sortOrder !== undefined ? { sortOrder: body.data.sortOrder } : {}),
+    },
+    include: { parcelType: { select: { id: true, code: true, name: true } } },
+  });
+  return ok(res, serialize(row));
+});
+
+adminRouter.delete("/logistics/partners/:partnerId/rates/:rateId", async (req, res) => {
+  const existing = await prisma.logisticsPartnerRate.findFirst({
+    where: { id: req.params.rateId, partnerId: req.params.partnerId },
+  });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Rate not found");
+  await prisma.logisticsPartnerRate.delete({ where: { id: existing.id } });
+  return ok(res, { ok: true });
+});
+
 adminRouter.get("/logistics/shipment-flow", async (_req, res) => {
-  return ok(res, serialize({ next: SHIPMENT_NEXT, defaults: DEFAULT_FREIGHT_PRICING }));
+  const parcelTypes = await listActiveParcelTypes();
+  const estimateConfig = await getLogisticsEstimateConfig();
+  return ok(
+    res,
+    serialize({
+      next: SHIPMENT_NEXT,
+      parcelTypes,
+      estimateConfig,
+      defaults: DEFAULT_FREIGHT_PRICING,
+      disclaimer: estimateConfig.estimateDisclaimer ?? DEFAULT_ESTIMATE_DISCLAIMER,
+    }),
+  );
 });
 
 adminRouter.post("/shipments/:id/advance", async (req, res) => {

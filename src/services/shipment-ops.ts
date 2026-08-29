@@ -213,6 +213,13 @@ export async function advanceShipmentOps(input: {
 
   assertValidShipmentTransition(shipment.status, status);
 
+  if (shipment.status === "TOP_UP_REQUIRED" && status === "READY_FOR_POD") {
+    const settlement = await prisma.shipmentSettlement.findUnique({ where: { shipmentId: shipment.id } });
+    if (settlement && settlement.topUpMinor > 0n) {
+      throw new Error("Pay the outstanding top-up before collection can proceed");
+    }
+  }
+
   if (status !== "IN_TRANSIT" || !input.skipSellerShipCheck) {
     requireSellerShippedForMarketOrder(
       shipment,
@@ -283,6 +290,9 @@ export async function settleShipmentOps(input: {
   if (shipment.settlement) {
     throw new Error("Already settled");
   }
+  if (shipment.status !== "CUSTOMS" && shipment.status !== "SETTLEMENT_PENDING") {
+    throw new Error("Settlement is only allowed after customs clearance (CUSTOMS or SETTLEMENT_PENDING status)");
+  }
   requireSellerShippedForMarketOrder(shipment, "customs settlement");
 
   let finalMinor = input.finalMinor;
@@ -331,6 +341,14 @@ export async function settleShipmentOps(input: {
         amountPositive: true,
         icon: "ship",
       });
+      await tx.notification.create({
+        data: {
+          userId: shipment.userId,
+          title: "Customs surplus credited",
+          body: `${formatMoney(currency, cashbackMinor)} refunded to your ₦ wallet for ${shipment.ref}.`,
+          href: `/logistics/shipments/${shipment.id}`,
+        },
+      });
     } else if (finalMinor! > locked) {
       topUpMinor = finalMinor! - locked;
       await consumeHold(tx, shipment.userId, currency, locked, "LOGISTICS_HOLD", "Logistics estimated charge");
@@ -340,6 +358,7 @@ export async function settleShipmentOps(input: {
           userId: shipment.userId,
           title: "Top-up required",
           body: `Shipment ${shipment.ref} needs ${formatMoney(currency, topUpMinor)} more after customs.`,
+          href: `/logistics/shipments/${shipment.id}`,
         },
       });
     } else {
