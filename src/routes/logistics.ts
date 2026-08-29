@@ -442,7 +442,7 @@ logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
       await recordTx(tx, {
         userId: req.user!.id,
         kind: "logistics_topup",
-        title: `Top-up ${shipment.ref}`,
+        title: "Outstanding shipping balance",
         currency: shipment.settlement!.currency,
         amountDisplay: `−${formatMoney(shipment.settlement!.currency, topUpAmount)}`,
         amountPositive: false,

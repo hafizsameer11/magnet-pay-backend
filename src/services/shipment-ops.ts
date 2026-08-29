@@ -330,12 +330,12 @@ export async function settleShipmentOps(input: {
         currency,
         cashbackMinor,
         "LOGISTICS_HOLD",
-        "Logistics cashback",
+        "Shipping adjustment refund",
       );
       await recordTx(tx, {
         userId: shipment.userId,
         kind: "logistics_cashback",
-        title: `Cashback ${shipment.ref}`,
+        title: "Shipping adjustment refund",
         currency,
         amountDisplay: `+${formatMoney(currency, cashbackMinor)}`,
         amountPositive: true,
@@ -344,8 +344,8 @@ export async function settleShipmentOps(input: {
       await tx.notification.create({
         data: {
           userId: shipment.userId,
-          title: "Customs surplus credited",
-          body: `${formatMoney(currency, cashbackMinor)} refunded to your ₦ wallet for ${shipment.ref}.`,
+          title: "Shipping adjustment refund",
+          body: `Final customs charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You paid ${formatMoney(currency, locked)}. ${formatMoney(currency, cashbackMinor)} was credited to your ₦ wallet.`,
           href: `/logistics/shipments/${shipment.id}`,
         },
       });
@@ -356,8 +356,8 @@ export async function settleShipmentOps(input: {
       await tx.notification.create({
         data: {
           userId: shipment.userId,
-          title: "Top-up required",
-          body: `Shipment ${shipment.ref} needs ${formatMoney(currency, topUpMinor)} more after customs.`,
+          title: "Additional payment required",
+          body: `Your final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You previously paid ${formatMoney(currency, locked)}. Please top up ${formatMoney(currency, topUpMinor)} before your shipment can be collected.`,
           href: `/logistics/shipments/${shipment.id}`,
         },
       });
@@ -401,15 +401,15 @@ export async function settleShipmentOps(input: {
       notifyUserEmail(
         user,
         "emailShipments",
-        `Top-up required · ${shipment.ref}`,
-        `Hi ${user?.name ?? "there"},\n\nCustoms clearing for ${shipment.ref} requires an additional ${formatMoney(currency, result.settlement.topUpMinor)}.\n\n— MagnetPay`,
+        `Additional payment required · ${shipment.ref}`,
+        `Hi ${user?.name ?? "there"},\n\nYour final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.\nYou previously paid ${formatMoney(currency, locked)}.\nPlease top up ${formatMoney(currency, result.settlement.topUpMinor)} before your shipment can be collected.\n\n— MagnetPay`,
       );
     } else {
       notifyUserEmail(
         user,
         "emailShipments",
-        `Customs settled · ${shipment.ref}`,
-        `Hi ${user?.name ?? "there"},\n\nFinal clearing cost for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.${result.settlement.cashbackMinor > 0n ? ` ${formatMoney(currency, result.settlement.cashbackMinor)} was credited to your wallet.` : ""}\n\n— MagnetPay`,
+        `Final shipping cost applied · ${shipment.ref}`,
+        `Hi ${user?.name ?? "there"},\n\nFinal clearing cost for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.${result.settlement.cashbackMinor > 0n ? ` ${formatMoney(currency, result.settlement.cashbackMinor)} was credited to your ₦ wallet as a shipping adjustment refund.` : ""}\n\n— MagnetPay`,
       );
     }
   }
