@@ -141,6 +141,25 @@ meRouter.post("/kyb", requireAuth, async (req, res) => {
       status: "SUBMITTED",
     },
   });
+
+  const user = await prisma.user.findUnique({ where: { id: req.user!.id }, select: { role: true } });
+  if (user?.role === "BUYER") {
+    await prisma.user.update({
+      where: { id: req.user!.id },
+      data: { role: "SELLER" },
+    });
+  }
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "kyb.submitted",
+      entity: "BusinessProfile",
+      entityId: profile.id,
+      meta: { companyName: profile.companyName },
+    },
+  });
+
   return ok(res, serialize(profile));
 });
 

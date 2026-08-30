@@ -529,10 +529,16 @@ async function sellerMeta(userId: string) {
 async function saveSellerMeta(userId: string, patch: Record<string, unknown>) {
   const existing = await sellerMeta(userId);
   const merged = { ...existing, ...patch };
+  const bp = await prisma.businessProfile.findUnique({ where: { userId }, select: { status: true, companyName: true } });
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { name: true } });
+  const companyName = bp?.companyName?.trim() || user?.name?.trim() || "Seller business";
   await prisma.businessProfile.upsert({
     where: { userId },
-    create: { userId, companyName: "Seller", documents: inputJson(merged), status: "DRAFT" },
-    update: { documents: inputJson(merged) },
+    create: { userId, companyName, documents: inputJson(merged), status: "DRAFT" },
+    update: {
+      documents: inputJson(merged),
+      ...(bp?.status === "DRAFT" || !bp ? { companyName } : {}),
+    },
   });
   return merged;
 }

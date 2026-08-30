@@ -124,15 +124,21 @@ authRouter.post("/otp/verify", async (req, res) => {
         await ensureUserLedgerAccounts(tx, user!.id, currency);
       });
     }
-  } else if (!user.email && verifiedEmail) {
-    const emailTaken = await prisma.user.findUnique({ where: { email: verifiedEmail } });
-    if (emailTaken && emailTaken.id !== user.id) {
-      return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
+  } else {
+    const patch: { email?: string; role?: "BUYER" | "SELLER" | "BOTH" } = {};
+    if (!user.email && verifiedEmail) {
+      const emailTaken = await prisma.user.findUnique({ where: { email: verifiedEmail } });
+      if (emailTaken && emailTaken.id !== user.id) {
+        return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
+      }
+      patch.email = verifiedEmail;
     }
-    user = await prisma.user.update({
-      where: { id: user.id },
-      data: { email: verifiedEmail },
-    });
+    if (body.data.role && user.role === "BUYER" && body.data.role !== "BUYER") {
+      patch.role = body.data.role;
+    }
+    if (Object.keys(patch).length) {
+      user = await prisma.user.update({ where: { id: user.id }, data: patch });
+    }
   }
 
   return ok(res, {
