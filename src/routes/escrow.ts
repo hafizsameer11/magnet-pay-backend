@@ -282,7 +282,7 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
         },
       });
     }
-    if (inviteEmail) {
+    if (inviteEmail && !sellerId) {
       await tx.escrowInvite.create({
         data: {
           escrowId: e.id,
