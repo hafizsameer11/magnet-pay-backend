@@ -13,6 +13,7 @@ import { getNombaProvider } from "../services/nomba.js";
 import { mpEmail, notifyUser } from "../services/user-notify.js";
 import { assertWithinDailyLimit, getWalletLimits } from "../services/limits.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
+import { isValidEmail, normalizeEmail } from "../services/email.js";
 
 export const walletsRouter = Router();
 
@@ -361,19 +362,38 @@ walletsRouter.post("/fx/convert", requireAuth, async (req, res) => {
 walletsRouter.post("/p2p", requireAuth, async (req, res) => {
   const body = z
     .object({
-      phone: z.string().min(8),
+      phone: z.string().min(8).optional(),
+      email: z.string().optional(),
       currency: z.enum(["NGN", "CNY", "USD"]),
       amountMinor: z.union([z.string(), z.number()]),
       note: z.string().max(200).optional(),
+    })
+    .refine((d) => Boolean(d.phone?.trim() || d.email?.trim()), {
+      message: "phone or email required",
+    })
+    .refine((d) => !(d.phone?.trim() && d.email?.trim()), {
+      message: "provide phone or email, not both",
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid P2P transfer");
   const amountMinor = BigInt(body.data.amountMinor);
   if (amountMinor <= 0n) return fail(res, 400, "VALIDATION", "Amount must be positive");
 
-  const phone = body.data.phone.replace(/\s+/g, "");
-  const recipient = await prisma.user.findFirst({ where: { phone } });
-  if (!recipient) return fail(res, 404, "NOT_FOUND", "No MagnetPay user with that phone");
+  const phoneRaw = body.data.phone?.replace(/\s+/g, "") ?? "";
+  const emailRaw = body.data.email?.trim() ?? "";
+  let recipient;
+  let recipientLabel: string;
+  if (emailRaw) {
+    if (!isValidEmail(emailRaw)) return fail(res, 400, "VALIDATION", "Invalid email");
+    const email = normalizeEmail(emailRaw);
+    recipient = await prisma.user.findFirst({ where: { email } });
+    if (!recipient) return fail(res, 404, "NOT_FOUND", "No MagnetPay user with that email");
+    recipientLabel = email;
+  } else {
+    recipient = await prisma.user.findFirst({ where: { phone: phoneRaw } });
+    if (!recipient) return fail(res, 404, "NOT_FOUND", "No MagnetPay user with that phone");
+    recipientLabel = phoneRaw;
+  }
   if (recipient.id === req.user!.id) {
     return fail(res, 400, "SELF_TRANSFER", "Cannot send to yourself");
   }
@@ -394,7 +414,7 @@ walletsRouter.post("/p2p", requireAuth, async (req, res) => {
         req.user!.id,
         body.data.currency,
         amountMinor,
-        `P2P to ${recipient.name || phone}`,
+        `P2P to ${recipient.name || recipientLabel}`,
       );
       await creditWallet(
         tx,
@@ -409,8 +429,8 @@ walletsRouter.post("/p2p", requireAuth, async (req, res) => {
       await recordTx(tx, {
         userId: req.user!.id,
         kind: "p2p",
-        title: `Sent to ${recipient.name || phone}`,
-        subtitle: note ?? phone,
+        title: `Sent to ${recipient.name || recipientLabel}`,
+        subtitle: note ?? recipientLabel,
         currency: body.data.currency,
         amountDisplay: `−${display}`,
         amountPositive: false,
@@ -421,7 +441,7 @@ walletsRouter.post("/p2p", requireAuth, async (req, res) => {
         userId: recipient.id,
         kind: "p2p",
         title: `Received from MagnetPay user`,
-        subtitle: note ?? phone,
+        subtitle: note ?? recipientLabel,
         currency: body.data.currency,
         amountDisplay: `+${display}`,
         amountPositive: true,
@@ -433,7 +453,12 @@ walletsRouter.post("/p2p", requireAuth, async (req, res) => {
         currency: body.data.currency,
         note: note ?? null,
         display,
-        recipient: { id: recipient.id, name: recipient.name, phone: recipient.phone },
+        recipient: {
+          id: recipient.id,
+          name: recipient.name,
+          phone: recipient.phone,
+          email: recipient.email,
+        },
       };
     });
     notifyUser(result.recipient.id, {
