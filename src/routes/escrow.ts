@@ -37,6 +37,10 @@ function inviteCode(token: string) {
   return token.slice(0, 12).toUpperCase();
 }
 
+function isEscrowSellerRole(role: string) {
+  return role === "SELLER" || role === "BOTH";
+}
+
 export const escrowRouter = Router();
 
 escrowRouter.get("/meta/fee", requireAuth, async (req, res) => {
@@ -103,10 +107,11 @@ escrowRouter.get("/meta/lookup", requireAuth, async (req, res) => {
     const email = normalizeEmail(emailRaw);
     const user = await prisma.user.findFirst({
       where: { email },
-      select: { id: true, name: true, email: true, phone: true },
+      select: { id: true, name: true, email: true, phone: true, role: true },
     });
     return ok(res, {
       found: Boolean(user),
+      eligible: user ? isEscrowSellerRole(user.role) : false,
       channel: "email",
       user: user ? serialize(user) : null,
     });
@@ -114,10 +119,11 @@ escrowRouter.get("/meta/lookup", requireAuth, async (req, res) => {
   if (phoneRaw) {
     const user = await prisma.user.findFirst({
       where: { phone: phoneRaw },
-      select: { id: true, name: true, email: true, phone: true },
+      select: { id: true, name: true, email: true, phone: true, role: true },
     });
     return ok(res, {
       found: Boolean(user),
+      eligible: user ? isEscrowSellerRole(user.role) : false,
       channel: "phone",
       user: user ? serialize(user) : null,
     });
@@ -218,9 +224,32 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
   if (!sellerId && inviteEmail) {
     const match = await prisma.user.findFirst({
       where: { email: inviteEmail },
-      select: { id: true },
+      select: { id: true, role: true },
     });
-    if (match) sellerId = match.id;
+    if (match) {
+      if (!isEscrowSellerRole(match.role)) {
+        return fail(
+          res,
+          400,
+          "NOT_SELLER",
+          "This email belongs to a buyer account. Escrow requires a seller.",
+        );
+      }
+      sellerId = match.id;
+    }
+  }
+  if (sellerId) {
+    if (sellerId === req.user!.id) {
+      return fail(res, 400, "SELF", "Cannot create escrow with yourself");
+    }
+    const seller = await prisma.user.findUnique({
+      where: { id: sellerId },
+      select: { id: true, role: true },
+    });
+    if (!seller) return fail(res, 404, "NOT_FOUND", "Seller not found");
+    if (!isEscrowSellerRole(seller.role)) {
+      return fail(res, 400, "NOT_SELLER", "Escrow counterparty must be a seller account");
+    }
   }
 
   const escrow = await prisma.$transaction(async (tx) => {
@@ -357,6 +386,9 @@ escrowRouter.post("/invite/:token/accept", requireAuth, async (req, res) => {
   });
   if (!invite || invite.expiresAt < new Date()) {
     return fail(res, 400, "INVALID_INVITE", "Invite invalid or expired");
+  }
+  if (!isEscrowSellerRole(req.user!.role)) {
+    return fail(res, 403, "NOT_SELLER", "Only seller accounts can accept escrow deals");
   }
   if (invite.email) {
     const user = await prisma.user.findUnique({

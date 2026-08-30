@@ -14,6 +14,7 @@ import { mpEmail, notifyUser } from "../services/user-notify.js";
 import { assertWithinDailyLimit, getWalletLimits } from "../services/limits.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 import { isValidEmail, normalizeEmail } from "../services/email.js";
+import { buildTransactionReceipt } from "../services/transaction-receipt.js";
 
 export const walletsRouter = Router();
 
@@ -70,7 +71,8 @@ walletsRouter.get("/transactions/:id", requireAuth, async (req, res) => {
     where: { id: param(req, "id"), userId: req.user!.id },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Transaction not found");
-  return ok(res, serialize(row));
+  const receipt = await buildTransactionReceipt(row);
+  return ok(res, serialize({ ...row, receipt }));
 });
 
 walletsRouter.get("/virtual-account", requireAuth, async (req, res) => {

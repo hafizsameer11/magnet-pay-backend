@@ -21,6 +21,7 @@ import {
   REQUIRED_SELLER_DOC_KINDS,
 } from "../services/order-docs.js";
 import { mpEmail, notifyUser, notifyUsers } from "../services/user-notify.js";
+import { parseProductSearchQuery, searchProducts } from "../services/product-search.js";
 
 export const marketRouter = Router();
 
@@ -133,21 +134,8 @@ async function ensureSellerStore(userId: string, name?: string) {
 /* ─── Catalog (public) ─────────────────────────────────────────────── */
 
 marketRouter.get("/products", async (req, res) => {
-  const q = typeof req.query.q === "string" ? req.query.q : undefined;
-  const category = typeof req.query.category === "string" ? req.query.category : undefined;
-  const storeId = typeof req.query.storeId === "string" ? req.query.storeId : undefined;
-  const products = await prisma.product.findMany({
-    where: {
-      active: true,
-      store: { verified: true },
-      ...(q ? { title: { contains: q } } : {}),
-      ...(category ? { category: { slug: category } } : {}),
-      ...(storeId ? { storeId } : {}),
-    },
-    include: { store: true, category: true },
-    take: 50,
-    orderBy: { createdAt: "desc" },
-  });
+  const filters = parseProductSearchQuery(req.query as Record<string, unknown>);
+  const products = await searchProducts(filters);
   return ok(res, serialize(products));
 });
 

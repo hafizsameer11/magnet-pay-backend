@@ -6,6 +6,11 @@ import { z } from "zod";
 import { mpEmail, notifyConversationPeers, notifyUser, notifyUsers } from "../services/user-notify.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
+import {
+  attachForConversation,
+  formatInboxTime,
+  inboxPeerRole,
+} from "../services/inbox.js";
 import { translateChatText } from "../services/chat-translate.js";
 import {
   ensureDefaultFxFeeConfig,
@@ -97,9 +102,10 @@ async function peerMetaForUser(peerUserId: string, conversationId: string) {
 
 messagesRouter.get("/conversations", requireAuth, async (req, res) => {
   const showArchived = req.query.archived === "1";
+  const me = req.user!;
   const parts = await prisma.conversationParticipant.findMany({
     where: {
-      userId: req.user!.id,
+      userId: me.id,
       hiddenAt: null,
       ...(showArchived ? {} : { archivedAt: null }),
     },
@@ -107,7 +113,11 @@ messagesRouter.get("/conversations", requireAuth, async (req, res) => {
       conversation: {
         include: {
           messages: { orderBy: { createdAt: "desc" }, take: 1 },
-          participants: { include: { user: { select: { id: true, name: true, phone: true } } } },
+          participants: {
+            include: {
+              user: { select: { id: true, name: true, phone: true, role: true, platformRole: true } },
+            },
+          },
         },
       },
     },
@@ -115,16 +125,42 @@ messagesRouter.get("/conversations", requireAuth, async (req, res) => {
   });
   const rows = await Promise.all(
     parts.map(async (p) => {
-      const peer = p.conversation.participants.find((x) => x.user.id !== req.user!.id)?.user;
+      const peerPart = p.conversation.participants.find((x) => x.user.id !== me.id);
+      const peer = peerPart?.user;
+      const mePart = p.conversation.participants.find((x) => x.user.id === me.id)?.user;
+      const amSeller = mePart?.role === "SELLER" || mePart?.role === "BOTH";
       const peerMeta = peer ? await peerMetaForUser(peer.id, p.conversation.id) : null;
+      const unreadCount = await prisma.message.count({
+        where: {
+          conversationId: p.conversation.id,
+          senderId: { not: me.id },
+          ...(p.lastReadAt ? { createdAt: { gt: p.lastReadAt } } : {}),
+        },
+      });
+      const attach = await attachForConversation({
+        latestQuoteId: p.conversation.latestQuoteId,
+        subject: p.conversation.subject,
+        productId: p.conversation.productId,
+      });
+      const latest = p.conversation.messages[0];
       return {
         ...p.conversation,
         myPrefs: {
           pinned: Boolean(p.pinnedAt),
           muted: p.muted,
           archived: Boolean(p.archivedAt),
+          lastReadAt: p.lastReadAt?.toISOString() ?? null,
         },
         peerMeta,
+        unreadCount,
+        inboxTime: formatInboxTime(latest?.createdAt?.toISOString() ?? p.conversation.updatedAt.toISOString()),
+        peerRole: peer
+          ? inboxPeerRole(peer.role, peer.platformRole, amSeller)
+          : mePart?.platformRole !== "USER"
+            ? "Mediator"
+            : "Supplier",
+        attach,
+        inboxTab: attach?.tab ?? null,
       };
     }),
   );
