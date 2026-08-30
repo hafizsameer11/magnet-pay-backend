@@ -26,6 +26,7 @@ export const DEFAULT_FX_FEE_CONFIG: { key: string; value: number }[] = [
   { key: "fx.NGN_USD", value: 7 },
   { key: "fx.USD_CNY", value: 72_000 },
   { key: "fx.CNY_USD", value: 1_390 },
+  { key: "escrow_fee_bps", value: 90 },
 ];
 
 export async function ensureDefaultFxFeeConfig() {

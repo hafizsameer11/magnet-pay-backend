@@ -216,7 +216,7 @@ async function main() {
 
   await prisma.feeConfig.createMany({
     data: [
-      { key: "escrow_fee_bps", value: 150 },
+      { key: "escrow_fee_bps", value: 90 },
       { key: "transfer_fee_bps", value: 75 },
       { key: "fx.CNY_NGN", value: 2_290_400 },
       { key: "fx.NGN_CNY", value: 44 },

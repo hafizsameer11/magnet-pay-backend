@@ -41,7 +41,8 @@ export const escrowRouter = Router();
 
 escrowRouter.get("/meta/fee", requireAuth, async (req, res) => {
   const amountMinor = BigInt(String(req.query.amountMinor ?? "0"));
-  const bps = 150;
+  const feeRow = await prisma.feeConfig.findUnique({ where: { key: "escrow_fee_bps" } });
+  const bps = feeRow?.value && feeRow.value > 0 ? feeRow.value : 90;
   const feeMinor = (amountMinor * BigInt(bps)) / 10000n;
   return ok(res, { feeBps: bps, feeMinor: feeMinor.toString(), feePct: bps / 10000 });
 });
