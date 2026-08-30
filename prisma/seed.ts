@@ -758,6 +758,14 @@ async function main() {
       status: "ACTIVE",
       progress: 0.25,
       inviteToken: "invite-demo-token",
+      inspectorId: "sgs",
+      feeSplit: "5050",
+      autoReleaseHours: 48,
+      requiredDocs: [
+        { id: "ci", label: "Commercial invoice", required: true },
+        { id: "pl", label: "Packing list", required: true },
+        { id: "bl", label: "Bill of lading / AWB", required: true },
+      ],
       milestones: {
         create: [
           { label: "Production complete", amountMinor: 260_000n, sortOrder: 0, status: "RELEASED" },
@@ -772,6 +780,29 @@ async function main() {
           { name: "QC photos", url: IMG.pump2 },
         ],
       },
+    },
+  });
+
+  await prisma.inspector.createMany({
+    data: [
+      { id: "sgs", name: "SGS", region: "Lagos · Guangzhou", feeMinor: 42000n, rating: 4.9 },
+      { id: "bv", name: "Bureau Veritas", region: "Apapa · Ningbo", feeMinor: 38000n, rating: 4.8 },
+      { id: "intertek", name: "Intertek", region: "Lagos · Shenzhen", feeMinor: 35000n, rating: 4.7 },
+      { id: "self", name: "Buyer self-inspection", region: "Buyer arranges", feeMinor: 0n, rating: 0 },
+      { id: "none", name: "No inspection", region: "Release on delivery", feeMinor: 0n, rating: 0 },
+    ],
+    skipDuplicates: true,
+  });
+
+  await prisma.inspectionRequest.create({
+    data: {
+      escrowId: escrow.id,
+      inspectorId: "sgs",
+      status: "IN_PROGRESS",
+      requiredDocs: [
+        { id: "ci", label: "Commercial invoice", required: true },
+        { id: "qc", label: "QC / inspection report", required: true },
+      ],
     },
   });
 

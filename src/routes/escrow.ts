@@ -10,6 +10,14 @@ import {
   settleEscrowRelease,
 } from "../services/ledger.js";
 import { fulfillmentForEscrow, releaseGate } from "../services/escrow-fulfillment.js";
+import {
+  createInspectionForEscrow,
+  ensureInspectorsSeeded,
+  getActiveInspection,
+  inspectionReleaseGate,
+  isThirdPartyInspector,
+  serializeInspection,
+} from "../services/escrow-inspection.js";
 import { mpEmail, notifyUser } from "../services/user-notify.js";
 import { isValidEmail, normalizeEmail, sendEventEmail } from "../services/email.js";
 
@@ -39,12 +47,23 @@ escrowRouter.get("/meta/fee", requireAuth, async (req, res) => {
 });
 
 escrowRouter.get("/meta/inspectors", requireAuth, async (_req, res) => {
-  return ok(res, [
-    { id: "sgs", name: "SGS", region: "Lagos · Guangzhou", feeMinor: "42000", rating: 4.9 },
-    { id: "bv", name: "Bureau Veritas", region: "Apapa · Ningbo", feeMinor: "38000", rating: 4.8 },
-    { id: "intertek", name: "Intertek", region: "Lagos · Shenzhen", feeMinor: "35000", rating: 4.7 },
-    { id: "none", name: "Self-inspection", region: "Buyer arranges", feeMinor: "0", rating: 0 },
-  ]);
+  await ensureInspectorsSeeded();
+  const rows = await prisma.inspector.findMany({
+    where: { active: true },
+    orderBy: { name: "asc" },
+  });
+  return ok(
+    res,
+    serialize(
+      rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        region: r.region,
+        feeMinor: r.feeMinor.toString(),
+        rating: r.rating,
+      })),
+    ),
+  );
 });
 
 escrowRouter.get("/meta/terms/:id", requireAuth, async (req, res) => {
@@ -162,8 +181,9 @@ escrowRouter.get("/:id", requireAuth, async (req, res) => {
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Escrow not found");
   const funded = row.milestones.find((m) => m.status === "FUNDED");
+  const inspection = await getActiveInspection(row.id);
   const fulfillment = await fulfillmentForEscrow(row.id, funded);
-  return ok(res, serialize({ ...row, fulfillment }));
+  return ok(res, serialize({ ...row, inspection: serializeInspection(inspection), fulfillment }));
 });
 
 escrowRouter.post("/", requireAuth, async (req, res) => {
@@ -175,6 +195,11 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       sellerId: z.string().uuid().optional(),
       inviteEmail: z.string().email().optional(),
       inspectorId: z.string().optional(),
+      feeSplit: z.enum(["buyer", "seller", "5050"]).optional(),
+      autoReleaseHours: z.number().int().min(0).max(168).optional(),
+      requiredDocs: z
+        .array(z.object({ id: z.string(), label: z.string(), required: z.boolean() }))
+        .optional(),
       milestones: z
         .array(z.object({ label: z.string(), amountMinor: z.union([z.string(), z.number()]) }))
         .optional(),
@@ -208,6 +233,9 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
         status: sellerId ? "AWAITING_FUNDS" : "AWAITING_SELLER",
         inviteToken,
         inspectorId: body.data.inspectorId || null,
+        feeSplit: body.data.feeSplit ?? "5050",
+        autoReleaseHours: body.data.autoReleaseHours ?? 48,
+        requiredDocs: body.data.requiredDocs ?? undefined,
       },
     });
     const ms =
@@ -409,6 +437,28 @@ escrowRouter.post("/:id/fund", requireAuth, async (req, res) => {
         include: { milestones: true },
       });
     });
+    await createInspectionForEscrow({
+      escrowId: escrow.id,
+      inspectorId: escrow.inspectorId,
+      requiredDocs: escrow.requiredDocs ?? undefined,
+    });
+    if (isThirdPartyInspector(escrow.inspectorId)) {
+      notifyUser(escrow.buyerId, {
+        title: "Inspection requested",
+        body: `"${escrow.title}" — MagnetPay ops will schedule third-party inspection.`,
+        href: `/escrow/${escrow.id}`,
+        emailPref: "emailEscrow",
+        emailSubject: "Escrow inspection requested",
+        emailText: mpEmail(null, [
+          `Third-party inspection was requested for escrow "${escrow.title}".`,
+          "Our operations team will schedule the inspection and upload the report.",
+        ]),
+      });
+    }
+    const updatedWithInspection = await prisma.escrow.findUnique({
+      where: { id: escrow.id },
+      include: { milestones: true },
+    });
     const partyIds = [escrow.buyerId, ...(escrow.sellerId ? [escrow.sellerId] : [])].filter(Boolean);
     for (const userId of partyIds) {
       notifyUser(userId, {
@@ -422,7 +472,7 @@ escrowRouter.post("/:id/fund", requireAuth, async (req, res) => {
         ]),
       });
     }
-    return ok(res, serialize(updated));
+    return ok(res, serialize(updatedWithInspection));
   } catch (e) {
     return fail(res, 400, "FUND_FAILED", e instanceof Error ? e.message : "Fund failed");
   }
@@ -437,11 +487,17 @@ escrowRouter.post("/:id/milestones/:msId/release", requireAuth, async (req, res)
   const ms = escrow.milestones.find((m) => m.id === param(req, "msId"));
   if (!ms || ms.status !== "FUNDED") return fail(res, 400, "BAD_STATE", "Milestone not releasable");
 
+  const inspection = await getActiveInspection(escrow.id);
+  const inspectionGate = inspectionReleaseGate(
+    inspection ? { status: inspection.status, inspectorId: inspection.inspectorId } : null,
+  );
   const gate = releaseGate({
     milestoneStatus: ms.status,
     releaseRequestedAt: ms.releaseRequestedAt,
     orderStatus: (await prisma.marketOrder.findFirst({ where: { escrowId: escrow.id }, select: { status: true } }))
       ?.status ?? null,
+    inspectionOk: inspectionGate.ok,
+    inspectionReason: inspectionGate.reason,
   });
   if (!gate.canRelease) {
     return fail(res, 400, "NOT_READY", gate.waitReason ?? "Seller has not confirmed shipment yet");

@@ -1,4 +1,5 @@
 import { prisma } from "../lib/prisma.js";
+import { getActiveInspection, inspectionReleaseGate } from "./escrow-inspection.js";
 
 export type Fulfillment = {
   orderId: string | null;
@@ -7,15 +8,21 @@ export type Fulfillment = {
   delivered: boolean;
   canRelease: boolean;
   waitReason: string | null;
+  inspectionStatus: string | null;
 };
 
 export function releaseGate(input: {
   milestoneStatus: string;
   releaseRequestedAt: Date | string | null | undefined;
   orderStatus: string | null;
+  inspectionOk?: boolean;
+  inspectionReason?: string | null;
 }): { canRelease: boolean; waitReason: string | null } {
   if (input.milestoneStatus !== "FUNDED") {
     return { canRelease: false, waitReason: "This milestone is not funded yet." };
+  }
+  if (input.inspectionOk === false) {
+    return { canRelease: false, waitReason: input.inspectionReason ?? "Inspection must pass before release." };
   }
   if (input.orderStatus) {
     if (input.orderStatus === "IN_ESCROW" || input.orderStatus === "PENDING_PAYMENT") {
@@ -52,12 +59,18 @@ export async function fulfillmentForEscrow(escrowId: string, milestone?: {
     where: { escrowId },
     select: { id: true, status: true },
   });
+  const inspection = await getActiveInspection(escrowId);
+  const inspectionGate = inspectionReleaseGate(
+    inspection ? { status: inspection.status, inspectorId: inspection.inspectorId } : null,
+  );
   const orderStatus = order?.status ?? null;
   const gate = milestone
     ? releaseGate({
         milestoneStatus: milestone.status,
         releaseRequestedAt: milestone.releaseRequestedAt,
         orderStatus,
+        inspectionOk: inspectionGate.ok,
+        inspectionReason: inspectionGate.reason,
       })
     : { canRelease: false, waitReason: null };
   return {
@@ -67,5 +80,6 @@ export async function fulfillmentForEscrow(escrowId: string, milestone?: {
     delivered: orderStatus === "DELIVERED" || orderStatus === "COMPLETED",
     canRelease: gate.canRelease,
     waitReason: gate.waitReason,
+    inspectionStatus: inspection?.status ?? null,
   };
 }

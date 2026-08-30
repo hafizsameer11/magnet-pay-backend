@@ -1333,10 +1333,117 @@ adminRouter.get("/escrows/:id", async (req, res) => {
       documents: true,
       buyer: { select: userSelect },
       seller: { select: userSelect },
+      inspections: {
+        orderBy: { createdAt: "desc" },
+        include: { inspector: true },
+        take: 1,
+      },
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Escrow not found");
   return ok(res, serialize(row));
+});
+
+adminRouter.get("/inspections", async (req, res) => {
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  const rows = await prisma.inspectionRequest.findMany({
+    where: status ? { status: status as never } : { status: { not: "WAIVED" } },
+    include: {
+      inspector: true,
+      escrow: {
+        include: {
+          buyer: { select: userSelect },
+          seller: { select: userSelect },
+        },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 200,
+  });
+  return ok(res, serialize(rows));
+});
+
+adminRouter.patch("/inspections/:id", async (req, res) => {
+  const body = z
+    .object({
+      status: z.enum(["REQUESTED", "SCHEDULED", "IN_PROGRESS", "PASSED", "FAILED"]).optional(),
+      reportUrl: z.string().url().optional().or(z.literal("")),
+      failedReason: z.string().max(500).optional(),
+      assignedToId: z.string().uuid().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid inspection update");
+
+  const existing = await prisma.inspectionRequest.findUnique({
+    where: { id: param(req, "id") },
+    include: { escrow: true, inspector: true },
+  });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Inspection not found");
+
+  const passedAt =
+    body.data.status === "PASSED" ? new Date() : body.data.status === "FAILED" ? null : existing.passedAt;
+
+  const updated = await prisma.inspectionRequest.update({
+    where: { id: existing.id },
+    data: {
+      status: body.data.status,
+      reportUrl: body.data.reportUrl === "" ? null : body.data.reportUrl,
+      failedReason: body.data.failedReason,
+      assignedToId: body.data.assignedToId,
+      passedAt,
+    },
+    include: {
+      inspector: true,
+      escrow: {
+        include: {
+          buyer: { select: userSelect },
+          seller: { select: userSelect },
+        },
+      },
+    },
+  });
+
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "inspection.update",
+      entity: "InspectionRequest",
+      entityId: updated.id,
+      meta: { status: updated.status, escrowId: updated.escrowId },
+    },
+  });
+
+  const partyIds = [updated.escrow.buyerId, updated.escrow.sellerId].filter(Boolean) as string[];
+  if (updated.status === "PASSED") {
+    notifyUsers(partyIds, {
+      title: "Inspection passed",
+      body: `"${updated.escrow.title}" — ${updated.inspector.name} report approved.`,
+      href: `/escrow/${updated.escrowId}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow inspection passed",
+      emailText: mpEmail(null, [
+        `Inspection passed for escrow "${updated.escrow.title}".`,
+        updated.reportUrl ? `Report: ${updated.reportUrl}` : "",
+        updated.escrow.autoReleaseHours
+          ? `Buyer has ${updated.escrow.autoReleaseHours}h to dispute before auto-release eligibility.`
+          : "",
+      ]),
+    });
+  } else if (updated.status === "FAILED") {
+    notifyUsers(partyIds, {
+      title: "Inspection failed",
+      body: updated.failedReason ?? `"${updated.escrow.title}" did not pass inspection.`,
+      href: `/escrow/${updated.escrowId}/dispute`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow inspection failed",
+      emailText: mpEmail(null, [
+        `Inspection failed for escrow "${updated.escrow.title}".`,
+        updated.failedReason ?? "Contact support or raise a dispute.",
+      ]),
+    });
+  }
+
+  return ok(res, serialize(updated));
 });
 
 adminRouter.get("/disputes", async (_req, res) => {

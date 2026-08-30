@@ -65,6 +65,15 @@ enum MilestoneStatus {
   DISPUTED
 }
 
+enum InspectionStatus {
+  REQUESTED
+  SCHEDULED
+  IN_PROGRESS
+  PASSED
+  FAILED
+  WAIVED
+}
+
 enum ShipMode {
   AIR
   SEA
@@ -738,29 +747,63 @@ model Review {
   @@index([productId])
 }
 
+model Inspector {
+  id          String              @id
+  name        String
+  region      String?
+  feeMinor    BigInt              @default(0)
+  rating      Float               @default(0)
+  active      Boolean             @default(true)
+  inspections InspectionRequest[]
+}
+
 model Escrow {
-  id             String           @id @default(uuid())
-  title          String
-  buyerId        String
-  sellerId       String?
-  amountMinor    BigInt
-  currency       Currency         @default(CNY)
-  status         EscrowStatus     @default(DRAFT)
-  platformFeeBps Int              @default(150)
-  inviteToken    String?          @unique
-  inspectorId    String?
-  progress       Float            @default(0)
-  createdAt      DateTime         @default(now())
-  updatedAt      DateTime         @updatedAt
-  buyer          User             @relation("EscrowBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
-  seller         User?            @relation("EscrowSeller", fields: [sellerId], references: [id], onDelete: SetNull)
-  milestones     EscrowMilestone[]
-  invites        EscrowInvite[]
-  documents      EscrowDocument[]
-  disputes       Dispute[]
+  id               String              @id @default(uuid())
+  title            String
+  buyerId          String
+  sellerId         String?
+  amountMinor      BigInt
+  currency         Currency            @default(CNY)
+  status           EscrowStatus        @default(DRAFT)
+  platformFeeBps   Int                 @default(150)
+  inviteToken      String?             @unique
+  inspectorId      String?
+  feeSplit         String?
+  autoReleaseHours Int?
+  requiredDocs     Json?
+  progress         Float               @default(0)
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+  buyer            User                @relation("EscrowBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
+  seller           User?               @relation("EscrowSeller", fields: [sellerId], references: [id], onDelete: SetNull)
+  milestones       EscrowMilestone[]
+  invites          EscrowInvite[]
+  documents        EscrowDocument[]
+  disputes         Dispute[]
+  inspections      InspectionRequest[]
 
   @@index([buyerId])
   @@index([sellerId])
+}
+
+model InspectionRequest {
+  id           String           @id @default(uuid())
+  escrowId     String
+  inspectorId  String
+  status       InspectionStatus @default(REQUESTED)
+  requiredDocs Json?
+  reportUrl    String?
+  failedReason String?
+  assignedToId String?
+  passedAt     DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  escrow       Escrow           @relation(fields: [escrowId], references: [id], onDelete: Cascade)
+  inspector    Inspector        @relation(fields: [inspectorId], references: [id])
+
+  @@index([escrowId])
+  @@index([status])
+  @@index([inspectorId])
 }
 
 model EscrowInvite {
