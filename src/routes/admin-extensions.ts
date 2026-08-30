@@ -24,8 +24,8 @@ import {
 } from "../services/admin-records.js";
 import {
   adjustUserWallet,
+  getWalletAdminOverview,
   getWalletUserDetail,
-  listWalletHolders,
   setWalletUserFrozen,
 } from "../services/admin-wallets.js";
 import { notifyConversationPeers, notifyUser, notifyUsers, mpEmail } from "../services/user-notify.js";
@@ -162,8 +162,8 @@ export function registerAdminExtensions(router: Router) {
   router.get("/shipments/stats", async (_req, res) => ok(res, serialize(await getShipmentStats())));
 
   router.get("/wallets/holders", async (_req, res) => {
-    const holders = await listWalletHolders();
-    return ok(res, serialize(holders));
+    const overview = await getWalletAdminOverview();
+    return ok(res, serialize(overview));
   });
 
   router.get("/wallets/:userId", async (req, res) => {

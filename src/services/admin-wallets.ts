@@ -174,6 +174,63 @@ export async function listWalletHolders() {
   return holders;
 }
 
+function isPlatformHolder(user: { name: string }) {
+  const n = user.name.toLowerCase();
+  return (
+    n.includes("magnetpay fees") ||
+    n.includes("magnetpay escrow") ||
+    n.includes("magnetpay treasury") ||
+    n.includes("liquidity bot")
+  );
+}
+
+export async function getWalletAdminOverview() {
+  const holders = await listWalletHolders();
+
+  let totalNgnMinor = 0n;
+  let totalCnyMinor = 0n;
+  let totalUsdMinor = 0n;
+  let walletCount = 0;
+  let escrowMinorNgn = 0;
+  let frozenCount = 0;
+  let limitedCount = 0;
+
+  const platformWallets = [];
+  const userHolders = [];
+
+  for (const h of holders) {
+    walletCount += h.wallets.length;
+    escrowMinorNgn += Number(h.stats.escrowMinorNgn);
+    if (h.status === "frozen") frozenCount++;
+    if (h.status === "limited") limitedCount++;
+
+    for (const w of h.wallets) {
+      const bal = BigInt(w.balanceMinor);
+      if (w.currency === "NGN") totalNgnMinor += bal;
+      else if (w.currency === "CNY") totalCnyMinor += bal;
+      else if (w.currency === "USD") totalUsdMinor += bal;
+    }
+
+    if (isPlatformHolder(h.user)) platformWallets.push(h);
+    else userHolders.push(h);
+  }
+
+  return {
+    summary: {
+      totalNgnMinor: totalNgnMinor.toString(),
+      totalCnyMinor: totalCnyMinor.toString(),
+      totalUsdMinor: totalUsdMinor.toString(),
+      walletCount,
+      escrowMinorNgn,
+      frozenCount,
+      limitedCount,
+      holderCount: userHolders.length,
+    },
+    platformWallets,
+    holders: userHolders,
+  };
+}
+
 export async function getWalletUserDetail(userId: string) {
   const summary = await buildWalletUserSummary(userId);
   if (!summary) return null;
@@ -184,7 +241,7 @@ export async function getWalletUserDetail(userId: string) {
       orderBy: { createdAt: "desc" },
       take: 40,
     }),
-    prisma.deposit.count({ where: { userId, status: { in: ["PENDING", "PROCESSING"] } } }),
+    prisma.deposit.count({ where: { userId, status: "PENDING" } }),
     prisma.withdrawal.count({ where: { userId, status: { in: ["PENDING", "PROCESSING"] } } }),
     prisma.escrow.count({
       where: {
