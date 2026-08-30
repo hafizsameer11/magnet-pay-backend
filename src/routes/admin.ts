@@ -1043,15 +1043,23 @@ adminRouter.post("/orders/:id/mark-shipped", async (req, res) => {
 });
 
 adminRouter.get("/products", async (_req, res) => {
+  const { orders30dByProductIds } = await import("../services/admin-analytics.js");
   const rows = await prisma.product.findMany({
     include: {
       store: { include: { user: { select: userSelect } } },
       category: true,
+      variants: { select: { sku: true }, orderBy: { createdAt: "asc" }, take: 5 },
+      reviews: { select: { rating: true }, orderBy: { createdAt: "desc" }, take: 5 },
     },
     orderBy: { createdAt: "desc" },
     take: 200,
   });
-  return ok(res, serialize(rows));
+  const orders30d = await orders30dByProductIds(rows.map((r) => r.id));
+  const enriched = rows.map((row) => ({
+    ...row,
+    orders30d: orders30d.get(row.id) ?? 0,
+  }));
+  return ok(res, serialize(enriched));
 });
 
 adminRouter.get("/products/:id", async (req, res) => {

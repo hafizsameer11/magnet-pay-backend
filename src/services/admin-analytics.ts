@@ -587,6 +587,20 @@ export async function getAdminAnalyticsCohorts() {
   return { cohorts: cohorts.slice(-6) };
 }
 
+export async function orders30dByProductIds(productIds: string[]) {
+  if (!productIds.length) return new Map<string, number>();
+  const since30 = daysAgo(30);
+  const groups = await prisma.orderItem.groupBy({
+    by: ["productId"],
+    where: {
+      productId: { in: productIds },
+      order: { createdAt: { gte: since30 }, status: { notIn: ["DRAFT", "CANCELLED"] } },
+    },
+    _sum: { qty: true },
+  });
+  return new Map(groups.map((g) => [g.productId, g._sum.qty ?? 0]));
+}
+
 export async function getProductStats(productId: string) {
   const since30 = daysAgo(30);
 
