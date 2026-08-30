@@ -17,12 +17,16 @@ function appPublicUrl() {
   return (
     process.env.APP_PUBLIC_URL?.trim() ||
     process.env.API_PUBLIC_URL?.trim()?.replace(/\/api\/?$/, "") ||
-    "https://magnetpay.app"
+    "https://magnetpay.amctraders.online"
   );
 }
 
-function escrowClaimUrl(token: string) {
-  return `${appPublicUrl()}/claim/${token}`;
+function appDownloadUrl() {
+  return process.env.APP_DOWNLOAD_URL?.trim() || `${appPublicUrl()}/download`;
+}
+
+function inviteCode(token: string) {
+  return token.slice(0, 12).toUpperCase();
 }
 
 export const escrowRouter = Router();
@@ -101,6 +105,26 @@ escrowRouter.get("/meta/lookup", requireAuth, async (req, res) => {
   return fail(res, 400, "VALIDATION", "email or phone required");
 });
 
+escrowRouter.get("/invite/lookup", async (req, res) => {
+  const code = String(req.query.code ?? "").trim().toLowerCase().replace(/[^a-f0-9]/g, "");
+  if (code.length < 8) return fail(res, 400, "VALIDATION", "Invite code too short");
+  const invite = await prisma.escrowInvite.findFirst({
+    where: { token: { startsWith: code } },
+    include: {
+      escrow: {
+        include: {
+          milestones: { orderBy: { sortOrder: "asc" } },
+          buyer: { select: { id: true, name: true, phone: true } },
+        },
+      },
+    },
+  });
+  if (!invite || invite.expiresAt < new Date()) {
+    return fail(res, 400, "INVALID_INVITE", "Invite invalid or expired");
+  }
+  return ok(res, serialize(invite));
+});
+
 escrowRouter.get("/invite/:token", async (req, res) => {
   const token = String(param(req, "token"));
   const invite = await prisma.escrowInvite.findUnique({
@@ -149,7 +173,6 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       amountMinor: z.union([z.string(), z.number()]),
       currency: z.enum(["NGN", "CNY", "USD"]).default("CNY"),
       sellerId: z.string().uuid().optional(),
-      invitePhone: z.string().optional(),
       inviteEmail: z.string().email().optional(),
       inspectorId: z.string().optional(),
       milestones: z
@@ -158,21 +181,14 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid escrow");
-  if (body.data.invitePhone && body.data.inviteEmail) {
-    return fail(res, 400, "VALIDATION", "Provide invitePhone or inviteEmail, not both");
+  if ((body.data as { invitePhone?: string }).invitePhone) {
+    return fail(res, 400, "VALIDATION", "Escrow invites are email-only. Use inviteEmail.");
   }
   const amountMinor = BigInt(body.data.amountMinor);
   const inviteToken = randomBytes(16).toString("hex");
   const inviteEmail = body.data.inviteEmail ? normalizeEmail(body.data.inviteEmail) : undefined;
 
   let sellerId = body.data.sellerId;
-  if (!sellerId && body.data.invitePhone) {
-    const match = await prisma.user.findFirst({
-      where: { phone: body.data.invitePhone },
-      select: { id: true },
-    });
-    if (match) sellerId = match.id;
-  }
   if (!sellerId && inviteEmail) {
     const match = await prisma.user.findFirst({
       where: { email: inviteEmail },
@@ -208,16 +224,7 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
         },
       });
     }
-    if (body.data.invitePhone) {
-      await tx.escrowInvite.create({
-        data: {
-          escrowId: e.id,
-          phone: body.data.invitePhone,
-          token: inviteToken,
-          expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
-        },
-      });
-    } else if (inviteEmail) {
+    if (inviteEmail) {
       await tx.escrowInvite.create({
         data: {
           escrowId: e.id,
@@ -241,28 +248,13 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       emailSubject: "New escrow deal",
       emailText: mpEmail(null, [`You were added to escrow "${body.data.title}".`]),
     });
-  } else if (body.data.invitePhone) {
-    const invitee = await prisma.user.findFirst({
-      where: { phone: body.data.invitePhone },
-      select: { id: true },
-    });
-    notifyUser(invitee?.id, {
-      title: "Escrow invite",
-      body: body.data.title,
-      href: `/escrow/invite/${inviteToken}`,
-      emailPref: "emailEscrow",
-      emailSubject: "Escrow invite",
-      emailText: mpEmail(null, [
-        `You were invited to escrow "${body.data.title}".`,
-        `Claim: ${escrowClaimUrl(inviteToken)}`,
-      ]),
-    });
   } else if (inviteEmail) {
+    const downloadUrl = appDownloadUrl();
+    const code = inviteCode(inviteToken);
     const invitee = await prisma.user.findFirst({
       where: { email: inviteEmail },
       select: { id: true },
     });
-    const claimLink = escrowClaimUrl(inviteToken);
     notifyUser(invitee?.id, {
       title: "Escrow invite",
       body: body.data.title,
@@ -271,23 +263,33 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       emailSubject: "MagnetPay escrow invite",
       emailText: mpEmail(null, [
         `You were invited to an escrow deal: "${body.data.title}".`,
-        `Open this link to review and claim: ${claimLink}`,
+        `Download MagnetPay: ${downloadUrl}`,
+        `Invite code: ${code}`,
       ]),
     });
     const buyer = await prisma.user.findUnique({
       where: { id: req.user!.id },
       select: { name: true },
     });
+    const amountLabel = formatMoney(body.data.currency, amountMinor);
     await sendEventEmail(
       inviteEmail,
       "MagnetPay escrow invite",
       mpEmail(null, [
-        `${buyer?.name ?? "A MagnetPay user"} invited you to an escrow deal: "${body.data.title}".`,
-        `Amount: ${body.data.amountMinor} ${body.data.currency}`,
+        `${buyer?.name ?? "A MagnetPay user"} invited you to an escrow deal on MagnetPay.`,
         "",
-        `Claim this deal: ${claimLink}`,
+        `Deal: ${body.data.title}`,
+        `Amount: ${amountLabel}`,
         "",
-        "If you don't have MagnetPay yet, the link will guide you through signup.",
+        "MagnetPay is mobile-only during early access. To accept this invite:",
+        "",
+        `1. Download the app: ${downloadUrl}`,
+        "2. Open MagnetPay and tap Accept escrow invite",
+        `3. Enter invite code: ${code}`,
+        "",
+        `Sign up with this email address (${inviteEmail}) so we can link the deal to your account.`,
+        "",
+        "The invite expires in 14 days.",
       ]),
     );
   }
@@ -326,6 +328,21 @@ escrowRouter.post("/invite/:token/accept", requireAuth, async (req, res) => {
   });
   if (!invite || invite.expiresAt < new Date()) {
     return fail(res, 400, "INVALID_INVITE", "Invite invalid or expired");
+  }
+  if (invite.email) {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { email: true },
+    });
+    const userEmail = user?.email ? normalizeEmail(user.email) : "";
+    if (userEmail && userEmail !== normalizeEmail(invite.email)) {
+      return fail(
+        res,
+        403,
+        "EMAIL_MISMATCH",
+        "Sign in with the email address this invite was sent to.",
+      );
+    }
   }
   const updated = await prisma.$transaction(async (tx) => {
     await tx.escrowInvite.update({
