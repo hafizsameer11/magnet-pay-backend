@@ -22,6 +22,12 @@ import {
   getAdminRecord,
   patchAdminRecord,
 } from "../services/admin-records.js";
+import {
+  adjustUserWallet,
+  getWalletUserDetail,
+  listWalletHolders,
+  setWalletUserFrozen,
+} from "../services/admin-wallets.js";
 import { notifyConversationPeers, notifyUser, notifyUsers, mpEmail } from "../services/user-notify.js";
 
 const userSelect = { id: true, name: true, phone: true, email: true, role: true };
@@ -155,20 +161,77 @@ export function registerAdminExtensions(router: Router) {
   router.get("/escrows/stats", async (_req, res) => ok(res, serialize(await getEscrowStats())));
   router.get("/shipments/stats", async (_req, res) => ok(res, serialize(await getShipmentStats())));
 
-  router.get("/wallets/:userId/stats", async (req, res) => {
-    const since30 = new Date(Date.now() - 30 * 86_400_000);
-    const wallets = await prisma.wallet.findMany({ where: { userId: param(req, "userId") } });
-    const txns = await prisma.transaction.count({
-      where: { userId: param(req, "userId"), createdAt: { gte: since30 } },
-    });
-    return ok(res, serialize({ wallets: wallets.length, txns30d: txns }));
+  router.get("/wallets/holders", async (_req, res) => {
+    const holders = await listWalletHolders();
+    return ok(res, serialize(holders));
   });
 
-  router.get("/money/ledger", async (_req, res) => {
+  router.get("/wallets/:userId", async (req, res) => {
+    const detail = await getWalletUserDetail(param(req, "userId"));
+    if (!detail) return fail(res, 404, "NOT_FOUND", "Wallet holder not found");
+    return ok(res, serialize(detail));
+  });
+
+  router.get("/wallets/:userId/stats", async (req, res) => {
+    const detail = await getWalletUserDetail(param(req, "userId"));
+    if (!detail) return fail(res, 404, "NOT_FOUND", "Wallet holder not found");
+    return ok(res, serialize({ wallets: detail.stats.currencyCount, txns30d: detail.stats.txns30d }));
+  });
+
+  router.post("/wallets/:userId/adjust", async (req, res) => {
+    const body = z
+      .object({
+        currency: z.enum(["NGN", "CNY", "USD"]),
+        amountMinor: z.union([z.string(), z.number()]),
+        direction: z.enum(["credit", "debit"]),
+        note: z.string().min(3).max(500),
+      })
+      .safeParse(req.body);
+    if (!body.success) return fail(res, 400, "VALIDATION", "Invalid adjustment payload");
+    const amountMinor = BigInt(body.data.amountMinor);
+    try {
+      const wallet = await adjustUserWallet({
+        userId: param(req, "userId"),
+        currency: body.data.currency,
+        amountMinor,
+        direction: body.data.direction,
+        note: body.data.note,
+        actorId: req.user!.id,
+      });
+      return ok(res, serialize(wallet));
+    } catch (e) {
+      return fail(res, 400, "ADJUST_FAILED", e instanceof Error ? e.message : "Adjustment failed");
+    }
+  });
+
+  router.post("/wallets/:userId/freeze", async (req, res) => {
+    const body = z
+      .object({
+        frozen: z.boolean(),
+        note: z.string().max(500).optional(),
+      })
+      .safeParse(req.body);
+    if (!body.success) return fail(res, 400, "VALIDATION", "Invalid freeze payload");
+    try {
+      const status = await setWalletUserFrozen({
+        userId: param(req, "userId"),
+        frozen: body.data.frozen,
+        note: body.data.note,
+        actorId: req.user!.id,
+      });
+      return ok(res, serialize({ status }));
+    } catch (e) {
+      return fail(res, 400, "FREEZE_FAILED", e instanceof Error ? e.message : "Could not update wallet access");
+    }
+  });
+
+  router.get("/money/ledger", async (req, res) => {
+    const userId = typeof req.query.userId === "string" && req.query.userId.trim() ? req.query.userId.trim() : undefined;
     const rows = await prisma.transaction.findMany({
+      where: userId ? { userId } : undefined,
       include: { user: { select: userSelect } },
       orderBy: { createdAt: "desc" },
-      take: 200,
+      take: userId ? 100 : 200,
     });
     return ok(res, serialize(rows.map((r) => ({
       id: r.id,
