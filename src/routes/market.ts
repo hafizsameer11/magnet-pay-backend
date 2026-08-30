@@ -13,7 +13,7 @@ import {
   type VariantOptions,
 } from "../services/product-variants.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
-import { requireSellerKyb } from "../services/seller-kyb.js";
+import { requireSellerKyb, sellerCanPublishLive } from "../services/seller-kyb.js";
 import { advanceShipmentOps } from "../services/shipment-ops.js";
 import {
   orderDocumentsForBuyer,
@@ -240,7 +240,7 @@ marketRouter.get("/seller/products", requireAuth, async (req, res) => {
   return ok(res, serialize(products));
 });
 
-marketRouter.post("/seller/products", requireAuth, requireSellerKyb, async (req, res) => {
+marketRouter.post("/seller/products", requireAuth, async (req, res) => {
   const body = z
     .object({
       title: z.string().min(2),
@@ -263,6 +263,10 @@ marketRouter.post("/seller/products", requireAuth, requireSellerKyb, async (req,
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
   const store = await ensureSellerStore(req.user!.id);
+  const canPublishLive = await sellerCanPublishLive(req.user!.id);
+  const wantsActive = body.data.active ?? true;
+  const active = canPublishLive && wantsActive;
+  const moderationStatus = active ? "ACTIVE" : "PENDING";
   const product = await prisma.$transaction(async (tx) => {
     const p = await tx.product.create({
       data: {
@@ -274,7 +278,8 @@ marketRouter.post("/seller/products", requireAuth, requireSellerKyb, async (req,
         imageUrl: body.data.imageUrl ?? body.data.mediaUrls?.[0] ?? null,
         moq: body.data.moq ?? "1 unit",
         categoryId: body.data.categoryId ?? null,
-        active: body.data.active ?? true,
+        active,
+        moderationStatus,
         ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
         ...(body.data.variantAxes !== undefined ? { variantAxes: body.data.variantAxes } : {}),
         ...(body.data.pricingTiers !== undefined ? { pricingTiers: body.data.pricingTiers } : {}),
@@ -308,7 +313,10 @@ marketRouter.post("/seller/products", requireAuth, requireSellerKyb, async (req,
       include: { media: true, category: true, store: true, variants: { where: { active: true } }, parcelType: true },
     });
   });
-  return ok(res, serialize(product), 201);
+  const publishNote = canPublishLive
+    ? undefined
+    : "Product saved as draft. It will go live automatically once your seller account is approved.";
+  return ok(res, { ...serialize(product), publishNote }, 201);
 });
 
 marketRouter.patch("/seller/products/:id", requireAuth, requireSellerKyb, async (req, res) => {

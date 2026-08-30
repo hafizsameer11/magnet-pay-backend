@@ -1088,10 +1088,17 @@ model ParcelType {
 }
 
 model LogisticsEstimateConfig {
-  id                  String   @id @default("default")
-  usdNgnEstimateRate  Int      @default(165000)
-  estimateDisclaimer  String   @default("This is an estimate, not the final price. Final cost is set when goods clear customs. Any difference is credited to your ₦ wallet or requires top-up before collection.")
-  updatedAt           DateTime @updatedAt
+  id                      String   @id @default("default")
+  usdNgnEstimateRate      Int      @default(165000)
+  estimateDisclaimer      String   @default("This is an estimate, not the final price. Final cost is set when goods clear customs. Any difference is credited to your ₦ wallet or requires top-up before collection.")
+  originHubs              Json?
+  packagingTypes          Json?
+  productSeaLclCnyPerCbm  Int      @default(320)
+  productDefaultDestination String @default("Apapa, Lagos")
+  productSeaTransitLabel  String   @default("26–32 days")
+  productEstimateModeLabel String @default("sea LCL")
+  productEstimateFootnote String?
+  updatedAt               DateTime @updatedAt
 }
 
 model ComplianceLimits {

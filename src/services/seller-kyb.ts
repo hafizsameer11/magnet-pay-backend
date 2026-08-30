@@ -9,6 +9,26 @@ export class KybRequiredError extends Error {
   }
 }
 
+/** Seller can list live products only after KYB approval and store verification. */
+export async function sellerCanPublishLive(userId: string) {
+  const [profile, store] = await Promise.all([
+    prisma.businessProfile.findUnique({ where: { userId }, select: { status: true } }),
+    prisma.sellerStore.findUnique({ where: { userId }, select: { verified: true } }),
+  ]);
+  return profile?.status === "APPROVED" && store?.verified === true;
+}
+
+/** Publish products that were saved as draft while the seller account was pending approval. */
+export async function activatePendingSellerProducts(userId: string) {
+  const store = await prisma.sellerStore.findUnique({ where: { userId }, select: { id: true } });
+  if (!store) return 0;
+  const result = await prisma.product.updateMany({
+    where: { storeId: store.id, moderationStatus: "PENDING", active: false },
+    data: { active: true, moderationStatus: "ACTIVE" },
+  });
+  return result.count;
+}
+
 export async function assertSellerKybApproved(userId: string) {
   const profile = await prisma.businessProfile.findUnique({
     where: { userId },

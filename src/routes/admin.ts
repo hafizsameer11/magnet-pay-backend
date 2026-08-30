@@ -1,19 +1,24 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
+import { activatePendingSellerProducts } from "../services/seller-kyb.js";
 import {fail, ok, requireAuth, requireAdmin, serialize, param } from "../lib/http.js";
 import { z } from "zod";
 import { mpEmail, notifyConversationPeers, notifyUser, notifyUsers } from "../services/user-notify.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 import {
-  getFreightPricing,
+  DEFAULT_ESTIMATE_DISCLAIMER,
+  DEFAULT_FREIGHT_PRICING,
   estimateFreightMinor,
   estimateQuoteFromParcelType,
+  getFreightPricing,
   getLogisticsEstimateConfig,
   listActiveParcelTypes,
-  DEFAULT_FREIGHT_PRICING,
-  DEFAULT_ESTIMATE_DISCLAIMER,
 } from "../services/freight-pricing.js";
+import {
+  originHubSchema,
+  packagingTypeSchema,
+} from "../services/logistics-product-config.js";
 import {
   getComplianceLimits,
   updateComplianceLimits,
@@ -560,6 +565,7 @@ adminRouter.post("/kyb/:id/decide", async (req, res) => {
       where: { userId: profile.userId },
       data: { verified: true },
     });
+    await activatePendingSellerProducts(profile.userId);
   } else if (body.data.status === "REJECTED") {
     await prisma.sellerStore.updateMany({
       where: { userId: profile.userId },
@@ -1300,6 +1306,9 @@ adminRouter.patch("/sellers/:id", async (req, res) => {
       _count: { select: { products: true, members: true } },
     },
   });
+  if (body.data.verified === true && !existing.verified) {
+    await activatePendingSellerProducts(existing.userId);
+  }
   return ok(res, serialize(row));
 });
 
@@ -1651,6 +1660,13 @@ adminRouter.put("/logistics/estimate-config", async (req, res) => {
     .object({
       usdNgnEstimateRate: z.number().int().positive(),
       estimateDisclaimer: z.string().min(10),
+      originHubs: z.array(originHubSchema).optional(),
+      packagingTypes: z.array(packagingTypeSchema).optional(),
+      productSeaLclCnyPerCbm: z.number().int().positive().optional(),
+      productDefaultDestination: z.string().min(2).optional(),
+      productSeaTransitLabel: z.string().min(2).optional(),
+      productEstimateModeLabel: z.string().min(2).optional(),
+      productEstimateFootnote: z.string().min(5).optional().nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid estimate config");

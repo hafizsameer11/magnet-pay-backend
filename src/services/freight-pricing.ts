@@ -1,5 +1,10 @@
 import type { FreightPricing, ParcelType, ShipMode } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
+import {
+  DEFAULT_ORIGIN_HUBS,
+  DEFAULT_PACKAGING_TYPES,
+  DEFAULT_PRODUCT_ESTIMATE_FOOTNOTE,
+} from "./logistics-defaults.js";
 
 export const DEFAULT_FREIGHT_PRICING = {
   airBaseMinor: 450_000,
@@ -25,7 +30,14 @@ export async function getLogisticsEstimateConfig() {
   const row = await prisma.logisticsEstimateConfig.findUnique({ where: { id: "default" } });
   if (row) return row;
   return prisma.logisticsEstimateConfig.create({
-    data: { id: "default", usdNgnEstimateRate: 165_000, estimateDisclaimer: DEFAULT_ESTIMATE_DISCLAIMER },
+    data: {
+      id: "default",
+      usdNgnEstimateRate: 165_000,
+      estimateDisclaimer: DEFAULT_ESTIMATE_DISCLAIMER,
+      originHubs: [...DEFAULT_ORIGIN_HUBS],
+      packagingTypes: [...DEFAULT_PACKAGING_TYPES],
+      productEstimateFootnote: DEFAULT_PRODUCT_ESTIMATE_FOOTNOTE,
+    },
   });
 }
 

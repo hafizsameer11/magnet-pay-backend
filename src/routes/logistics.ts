@@ -11,6 +11,10 @@ import {
 import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-codes.js";
 import { mpEmail, notifyConversationPeers, notifyUser } from "../services/user-notify.js";
 import { estimateQuoteFromParcelType, estimateQuoteMinor, getLogisticsEstimateConfig, listActiveParcelTypes } from "../services/freight-pricing.js";
+import {
+  getLogisticsProductWizardConfig,
+  previewProductShippingEstimate,
+} from "../services/logistics-product-config.js";
 import { generatePartnerQuotes, serializeQuoteForCompare } from "../services/partner-quotes.js";
 import { inferParcelTypeForOrder } from "../services/parcel-type-infer.js";
 import { advanceShipmentOps, attachShipmentDocument } from "../services/shipment-ops.js";
@@ -48,6 +52,29 @@ logisticsRouter.get("/parcel-types", requireAuth, async (_req, res) => {
 logisticsRouter.get("/estimate-config", requireAuth, async (_req, res) => {
   const config = await getLogisticsEstimateConfig();
   return ok(res, serialize(config));
+});
+
+logisticsRouter.get("/product-wizard-config", requireAuth, async (_req, res) => {
+  const config = await getLogisticsProductWizardConfig();
+  return ok(res, serialize(config));
+});
+
+logisticsRouter.post("/product-shipping-preview", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      cbmPerUnit: z.number().nonnegative(),
+      weightKgPerUnit: z.number().nonnegative().optional(),
+      originCity: z.string().min(1),
+      parcelTypeId: z.string().uuid().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid preview input");
+  try {
+    const preview = await previewProductShippingEstimate(body.data);
+    return ok(res, serialize(preview));
+  } catch (e) {
+    return fail(res, 400, "PREVIEW_FAILED", e instanceof Error ? e.message : "Preview failed");
+  }
 });
 
 logisticsRouter.post("/estimate", requireAuth, async (req, res) => {
