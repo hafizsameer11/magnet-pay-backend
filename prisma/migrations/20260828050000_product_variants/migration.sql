@@ -1,34 +1,36 @@
--- CreateTable
-CREATE TABLE "ProductVariant" (
-    "id" TEXT NOT NULL,
-    "productId" TEXT NOT NULL,
-    "sku" TEXT,
-    "options" JSONB NOT NULL,
-    "priceMinor" BIGINT NOT NULL,
-    "stock" INTEGER,
-    "imageUrl" TEXT,
-    "active" BOOLEAN NOT NULL DEFAULT true,
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+DROP TABLE IF EXISTS `ProductVariant`;
 
-    CONSTRAINT "ProductVariant_pkey" PRIMARY KEY ("id")
-);
+CREATE TABLE `ProductVariant` (
+    `id` VARCHAR(191) NOT NULL,
+    `productId` VARCHAR(191) NOT NULL,
+    `sku` VARCHAR(191) NULL,
+    `options` JSON NOT NULL,
+    `priceMinor` BIGINT NOT NULL,
+    `stock` INTEGER NULL,
+    `imageUrl` VARCHAR(191) NULL,
+    `active` BOOLEAN NOT NULL DEFAULT true,
+    `createdAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 
--- CartItem variant columns
-ALTER TABLE "CartItem" ADD COLUMN "variantId" TEXT;
-ALTER TABLE "CartItem" ADD COLUMN "variantKey" TEXT NOT NULL DEFAULT '';
+    INDEX `ProductVariant_productId_idx`(`productId`),
+    PRIMARY KEY (`id`)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- OrderItem variant columns
-ALTER TABLE "OrderItem" ADD COLUMN "variantId" TEXT;
-ALTER TABLE "OrderItem" ADD COLUMN "variantLabel" TEXT;
+ALTER TABLE `CartItem` ADD COLUMN `variantId` VARCHAR(191) NULL;
+ALTER TABLE `CartItem` ADD COLUMN `variantKey` VARCHAR(191) NOT NULL DEFAULT '';
 
--- Drop old cart uniqueness
-DROP INDEX IF EXISTS "CartItem_cartId_productId_key";
+ALTER TABLE `OrderItem` ADD COLUMN `variantId` VARCHAR(191) NULL;
+ALTER TABLE `OrderItem` ADD COLUMN `variantLabel` VARCHAR(191) NULL;
 
--- CreateIndex
-CREATE INDEX "ProductVariant_productId_idx" ON "ProductVariant"("productId");
-CREATE UNIQUE INDEX "CartItem_cartId_productId_variantKey_key" ON "CartItem"("cartId", "productId", "variantKey");
+ALTER TABLE `CartItem` DROP FOREIGN KEY `CartItem_cartId_fkey`;
+ALTER TABLE `CartItem` DROP FOREIGN KEY `CartItem_productId_fkey`;
+DROP INDEX `CartItem_cartId_productId_key` ON `CartItem`;
 
--- AddForeignKey
-ALTER TABLE "ProductVariant" ADD CONSTRAINT "ProductVariant_productId_fkey" FOREIGN KEY ("productId") REFERENCES "Product"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-ALTER TABLE "CartItem" ADD CONSTRAINT "CartItem_variantId_fkey" FOREIGN KEY ("variantId") REFERENCES "ProductVariant"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-ALTER TABLE "OrderItem" ADD CONSTRAINT "OrderItem_variantId_fkey" FOREIGN KEY ("variantId") REFERENCES "ProductVariant"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+CREATE UNIQUE INDEX `CartItem_cartId_productId_variantKey_key` ON `CartItem`(`cartId`, `productId`, `variantKey`);
+CREATE INDEX `CartItem_productId_idx` ON `CartItem`(`productId`);
+
+ALTER TABLE `CartItem` ADD CONSTRAINT `CartItem_cartId_fkey` FOREIGN KEY (`cartId`) REFERENCES `Cart`(`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE `CartItem` ADD CONSTRAINT `CartItem_productId_fkey` FOREIGN KEY (`productId`) REFERENCES `Product`(`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+
+ALTER TABLE `ProductVariant` ADD CONSTRAINT `ProductVariant_productId_fkey` FOREIGN KEY (`productId`) REFERENCES `Product`(`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE `CartItem` ADD CONSTRAINT `CartItem_variantId_fkey` FOREIGN KEY (`variantId`) REFERENCES `ProductVariant`(`id`) ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE `OrderItem` ADD CONSTRAINT `OrderItem_variantId_fkey` FOREIGN KEY (`variantId`) REFERENCES `ProductVariant`(`id`) ON DELETE SET NULL ON UPDATE CASCADE;

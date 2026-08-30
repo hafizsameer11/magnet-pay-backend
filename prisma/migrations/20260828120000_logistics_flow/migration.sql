@@ -1,71 +1,45 @@
--- CreateEnum
-CREATE TYPE "DeliveryMethod" AS ENUM ('PICKUP', 'DOORSTEP');
+ALTER TABLE `Product`
+    ADD COLUMN `cbmPerUnit` DOUBLE NULL,
+    ADD COLUMN `weightKgPerUnit` DOUBLE NULL,
+    ADD COLUMN `originHub` VARCHAR(191) NULL,
+    ADD COLUMN `leadTimeMin` INTEGER NULL,
+    ADD COLUMN `leadTimeMax` INTEGER NULL,
+    ADD COLUMN `packagingType` VARCHAR(191) NULL,
+    ADD COLUMN `defaultIncoterm` VARCHAR(191) NULL DEFAULT 'FOB';
 
--- CreateEnum
-CREATE TYPE "LogisticsStatus" AS ENUM ('NOT_BOOKED', 'QUOTE_PENDING', 'BOOKED', 'IN_TRANSIT', 'DELIVERED');
+ALTER TABLE `MarketOrder`
+    ADD COLUMN `shipmentId` VARCHAR(191) NULL,
+    ADD COLUMN `deliveryMethod` ENUM('PICKUP', 'DOORSTEP') NULL,
+    ADD COLUMN `deliveryAddress` JSON NULL,
+    ADD COLUMN `logisticsStatus` ENUM('NOT_BOOKED', 'QUOTE_PENDING', 'BOOKED', 'IN_TRANSIT', 'DELIVERED') NOT NULL DEFAULT 'NOT_BOOKED';
 
--- CreateEnum
-CREATE TYPE "ClaimStatus" AS ENUM ('OPEN', 'RESOLVED', 'REJECTED');
+ALTER TABLE `ShippingQuoteRequest`
+    ADD COLUMN `orderId` VARCHAR(191) NULL,
+    ADD COLUMN `destinationDelivery` ENUM('PICKUP', 'DOORSTEP') NULL;
 
--- AlterTable Product
-ALTER TABLE "Product" ADD COLUMN "cbmPerUnit" DOUBLE PRECISION,
-ADD COLUMN "weightKgPerUnit" DOUBLE PRECISION,
-ADD COLUMN "originHub" TEXT,
-ADD COLUMN "leadTimeMin" INTEGER,
-ADD COLUMN "leadTimeMax" INTEGER,
-ADD COLUMN "packagingType" TEXT,
-ADD COLUMN "defaultIncoterm" TEXT DEFAULT 'FOB';
+CREATE TABLE `ShipmentClaim` (
+    `id` VARCHAR(191) NOT NULL,
+    `shipmentId` VARCHAR(191) NOT NULL,
+    `userId` VARCHAR(191) NOT NULL,
+    `type` VARCHAR(191) NOT NULL,
+    `amountMinor` BIGINT NULL,
+    `currency` ENUM('NGN', 'CNY', 'USD') NOT NULL DEFAULT 'NGN',
+    `description` TEXT NOT NULL,
+    `evidenceUrls` JSON NOT NULL,
+    `status` ENUM('OPEN', 'RESOLVED', 'REJECTED') NOT NULL DEFAULT 'OPEN',
+    `createdAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    `updatedAt` DATETIME(3) NOT NULL,
 
--- AlterTable MarketOrder
-ALTER TABLE "MarketOrder" ADD COLUMN "shipmentId" TEXT,
-ADD COLUMN "deliveryMethod" "DeliveryMethod",
-ADD COLUMN "deliveryAddress" JSONB,
-ADD COLUMN "logisticsStatus" "LogisticsStatus" NOT NULL DEFAULT 'NOT_BOOKED';
+    INDEX `ShipmentClaim_shipmentId_idx`(`shipmentId`),
+    INDEX `ShipmentClaim_userId_idx`(`userId`),
+    PRIMARY KEY (`id`)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- AlterTable ShippingQuoteRequest
-ALTER TABLE "ShippingQuoteRequest" ADD COLUMN "orderId" TEXT,
-ADD COLUMN "destinationDelivery" "DeliveryMethod";
+CREATE UNIQUE INDEX `MarketOrder_shipmentId_key` ON `MarketOrder`(`shipmentId`);
+CREATE INDEX `MarketOrder_shipmentId_idx` ON `MarketOrder`(`shipmentId`);
+CREATE INDEX `ShippingQuoteRequest_orderId_idx` ON `ShippingQuoteRequest`(`orderId`);
 
--- CreateTable ShipmentClaim
-CREATE TABLE "ShipmentClaim" (
-    "id" TEXT NOT NULL,
-    "shipmentId" TEXT NOT NULL,
-    "userId" TEXT NOT NULL,
-    "type" TEXT NOT NULL,
-    "amountMinor" BIGINT,
-    "currency" "Currency" NOT NULL DEFAULT 'NGN',
-    "description" TEXT NOT NULL,
-    "evidenceUrls" JSONB NOT NULL DEFAULT '[]',
-    "status" "ClaimStatus" NOT NULL DEFAULT 'OPEN',
-    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" TIMESTAMP(3) NOT NULL,
-
-    CONSTRAINT "ShipmentClaim_pkey" PRIMARY KEY ("id")
-);
-
--- CreateIndex
-CREATE UNIQUE INDEX "MarketOrder_shipmentId_key" ON "MarketOrder"("shipmentId");
-
--- CreateIndex
-CREATE INDEX "MarketOrder_shipmentId_idx" ON "MarketOrder"("shipmentId");
-
--- CreateIndex
-CREATE INDEX "ShippingQuoteRequest_orderId_idx" ON "ShippingQuoteRequest"("orderId");
-
--- CreateIndex
-CREATE INDEX "ShipmentClaim_shipmentId_idx" ON "ShipmentClaim"("shipmentId");
-
--- CreateIndex
-CREATE INDEX "ShipmentClaim_userId_idx" ON "ShipmentClaim"("userId");
-
--- AddForeignKey
-ALTER TABLE "MarketOrder" ADD CONSTRAINT "MarketOrder_shipmentId_fkey" FOREIGN KEY ("shipmentId") REFERENCES "Shipment"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "ShippingQuoteRequest" ADD CONSTRAINT "ShippingQuoteRequest_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "MarketOrder"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "ShipmentClaim" ADD CONSTRAINT "ShipmentClaim_shipmentId_fkey" FOREIGN KEY ("shipmentId") REFERENCES "Shipment"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-
--- AddForeignKey
-ALTER TABLE "ShipmentClaim" ADD CONSTRAINT "ShipmentClaim_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE `MarketOrder` ADD CONSTRAINT `MarketOrder_shipmentId_fkey` FOREIGN KEY (`shipmentId`) REFERENCES `Shipment`(`id`) ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE `ShippingQuoteRequest` ADD CONSTRAINT `ShippingQuoteRequest_orderId_fkey` FOREIGN KEY (`orderId`) REFERENCES `MarketOrder`(`id`) ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE `ShipmentClaim` ADD CONSTRAINT `ShipmentClaim_shipmentId_fkey` FOREIGN KEY (`shipmentId`) REFERENCES `Shipment`(`id`) ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE `ShipmentClaim` ADD CONSTRAINT `ShipmentClaim_userId_fkey` FOREIGN KEY (`userId`) REFERENCES `User`(`id`) ON DELETE CASCADE ON UPDATE CASCADE;

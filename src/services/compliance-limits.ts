@@ -8,9 +8,9 @@ export const DEFAULT_COMPLIANCE_LIMITS = {
   cnyDailyCapMinor: 200_000_00,
   minTierDeposit: 1,
   minTierWithdraw: 1,
-  minTierCrossBorder: 2,
-  minTierMarketCheckout: 2,
-  minTierLogistics: 2,
+  minTierCrossBorder: 1,
+  minTierMarketCheckout: 1,
+  minTierLogistics: 1,
   allowBasicWhilePending: true,
 } as const;
 

@@ -8,6 +8,12 @@ import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 import { translateChatText } from "../services/chat-translate.js";
 import {
+  ensureDefaultFxFeeConfig,
+  feeConfigKeyToPair,
+  syncFeeConfigRatesToFxTable,
+  syncFxTableToFeeConfig,
+} from "../services/fx-rates-sync.js";
+import {
   DEFAULT_ESTIMATE_DISCLAIMER,
   DEFAULT_FREIGHT_PRICING,
   estimateFreightMinor,
@@ -1579,10 +1585,18 @@ adminRouter.get("/shipments/:id", async (req, res) => {
 });
 
 adminRouter.get("/fx/rates", async (_req, res) => {
-  const rows = await prisma.feeConfig.findMany({
+  await ensureDefaultFxFeeConfig();
+  let rows = await prisma.feeConfig.findMany({
     where: { key: { startsWith: "fx." } },
     orderBy: { key: "asc" },
   });
+  if (!rows.some((r) => feeConfigKeyToPair(r.key))) {
+    await syncFxTableToFeeConfig();
+    rows = await prisma.feeConfig.findMany({
+      where: { key: { startsWith: "fx." } },
+      orderBy: { key: "asc" },
+    });
+  }
   return ok(res, serialize(rows));
 });
 
@@ -1623,7 +1637,8 @@ adminRouter.put("/fx/rates", async (req, res) => {
       meta: { count: updated.length, keys: updated.map((r) => r.key) },
     },
   });
-  return ok(res, serialize(updated));
+  const synced = await syncFeeConfigRatesToFxTable();
+  return ok(res, serialize({ updated, synced }));
 });
 
 adminRouter.get("/fx/conversions", async (_req, res) => {

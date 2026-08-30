@@ -1,0 +1,1 @@
+ALTER TABLE `Recipient` ADD COLUMN `starred` BOOLEAN NOT NULL DEFAULT false;

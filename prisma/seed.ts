@@ -218,6 +218,13 @@ async function main() {
     data: [
       { key: "escrow_fee_bps", value: 150 },
       { key: "transfer_fee_bps", value: 75 },
+      { key: "fx.CNY_NGN", value: 2_290_400 },
+      { key: "fx.NGN_CNY", value: 44 },
+      { key: "fx.USD_NGN", value: 15_400_000 },
+      { key: "fx.NGN_USD", value: 7 },
+      { key: "fx.USD_CNY", value: 72000 },
+      { key: "fx.CNY_USD", value: 1390 },
+      { key: "fx.spread_bps", value: 50 },
     ],
   });
 
@@ -225,9 +232,18 @@ async function main() {
     data: { id: "default" },
   });
 
-  await prisma.complianceLimits.create({
-    data: { id: "default", ...DEFAULT_COMPLIANCE_LIMITS },
+  await prisma.complianceLimits.upsert({
+    where: { id: "default" },
+    create: { id: "default", ...DEFAULT_COMPLIANCE_LIMITS },
+    update: {
+      minTierCrossBorder: 1,
+      minTierMarketCheckout: 1,
+      minTierLogistics: 1,
+    },
   });
+
+  const { syncFeeConfigRatesToFxTable } = await import("../src/services/fx-rates-sync.js");
+  await syncFeeConfigRatesToFxTable();
 
   await prisma.logisticsPartner.createMany({
     data: [

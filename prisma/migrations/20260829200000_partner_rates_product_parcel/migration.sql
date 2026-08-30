@@ -35,7 +35,7 @@ CREATE TABLE `LogisticsPartnerRate` (
     `updatedAt` DATETIME(3) NOT NULL,
 
     PRIMARY KEY (`id`)
-);
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 CREATE INDEX `LogisticsPartnerRate_partnerId_mode_active_idx` ON `LogisticsPartnerRate`(`partnerId`, `mode`, `active`);
 CREATE INDEX `LogisticsPartnerRate_parcelTypeId_idx` ON `LogisticsPartnerRate`(`parcelTypeId`);
