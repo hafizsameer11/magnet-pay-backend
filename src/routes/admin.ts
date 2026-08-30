@@ -1086,8 +1086,9 @@ adminRouter.get("/products/:id", async (req, res) => {
 adminRouter.post("/products/:id/moderate", async (req, res) => {
   const body = z
     .object({
-      status: z.enum(["APPROVED", "HIDDEN", "REJECTED"]).optional(),
+      status: z.enum(["APPROVED", "HIDDEN", "REJECTED", "PENDING", "REPORTED"]).optional(),
       active: z.boolean().optional(),
+      flagReason: z.string().optional().nullable(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "status or active required");
@@ -1098,13 +1099,18 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
   const existing = await prisma.product.findUnique({ where: { id: param(req, "id") } });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Product not found");
 
-  // Product has `active` boolean — map moderation statuses
   let active = existing.active;
   let moderationStatus = existing.moderationStatus;
   if (body.data.active !== undefined) active = body.data.active;
   else if (body.data.status === "APPROVED") {
     active = true;
     moderationStatus = "ACTIVE";
+  } else if (body.data.status === "PENDING") {
+    active = false;
+    moderationStatus = "PENDING";
+  } else if (body.data.status === "REPORTED") {
+    active = false;
+    moderationStatus = "REPORTED";
   } else if (body.data.status === "HIDDEN") {
     active = false;
     moderationStatus = "HIDDEN";
@@ -1115,7 +1121,11 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
 
   const row = await prisma.product.update({
     where: { id: param(req, "id") },
-    data: { active, moderationStatus },
+    data: {
+      active,
+      moderationStatus,
+      ...(body.data.flagReason !== undefined ? { flagReason: body.data.flagReason } : {}),
+    },
     include: { store: true, category: true, brand: true },
   });
   await prisma.auditLog.create({
@@ -1155,7 +1165,15 @@ const adminProductPatchSchema = z.object({
   packagingType: z.string().min(1).optional().nullable(),
   defaultIncoterm: z.string().min(2).optional().nullable(),
   parcelTypeId: z.string().uuid().optional().nullable(),
+  imageUrl: z.string().min(1).optional().nullable(),
+  mediaUrls: z.array(z.string().min(1)).optional(),
+  moderationStatus: z.enum(["ACTIVE", "PENDING", "REPORTED", "HIDDEN", "REJECTED"]).optional(),
+  flagReason: z.string().optional().nullable(),
 });
+
+function activeFromModerationStatus(status: string) {
+  return status === "ACTIVE";
+}
 
 adminRouter.patch("/products/:id", async (req, res) => {
   const existing = await prisma.product.findUnique({ where: { id: param(req, "id") } });
@@ -1163,39 +1181,68 @@ adminRouter.patch("/products/:id", async (req, res) => {
   const body = adminProductPatchSchema.safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product fields");
 
-  const row = await prisma.product.update({
-    where: { id: existing.id },
-    data: {
-      ...(body.data.title !== undefined ? { title: body.data.title } : {}),
-      ...(body.data.description !== undefined ? { description: body.data.description } : {}),
-      ...(body.data.priceMinor !== undefined ? { priceMinor: BigInt(body.data.priceMinor) } : {}),
-      ...(body.data.moq !== undefined ? { moq: body.data.moq } : {}),
-      ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
-      ...(body.data.active !== undefined ? { active: body.data.active } : {}),
-      ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
-      ...(body.data.cbmPerUnit !== undefined ? { cbmPerUnit: body.data.cbmPerUnit } : {}),
-      ...(body.data.weightKgPerUnit !== undefined ? { weightKgPerUnit: body.data.weightKgPerUnit } : {}),
-      ...(body.data.originHub !== undefined ? { originHub: body.data.originHub } : {}),
-      ...(body.data.leadTimeMin !== undefined ? { leadTimeMin: body.data.leadTimeMin } : {}),
-      ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
-      ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
-      ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
-      ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
-    },
-    include: {
-      store: { include: { user: { select: userSelect } } },
-      category: true,
-      brand: true,
-      media: { orderBy: { sortOrder: "asc" } },
-      variants: { orderBy: { createdAt: "asc" } },
-      reviews: {
-        orderBy: { createdAt: "desc" },
-        take: 10,
-        include: { user: { select: userSelect } },
+  const moderationStatus = body.data.moderationStatus;
+  const active =
+    moderationStatus !== undefined
+      ? activeFromModerationStatus(moderationStatus)
+      : body.data.active;
+
+  const row = await prisma.$transaction(async (tx) => {
+    const p = await tx.product.update({
+      where: { id: existing.id },
+      data: {
+        ...(body.data.title !== undefined ? { title: body.data.title } : {}),
+        ...(body.data.description !== undefined ? { description: body.data.description } : {}),
+        ...(body.data.priceMinor !== undefined ? { priceMinor: BigInt(body.data.priceMinor) } : {}),
+        ...(body.data.moq !== undefined ? { moq: body.data.moq } : {}),
+        ...(body.data.categoryId !== undefined ? { categoryId: body.data.categoryId } : {}),
+        ...(active !== undefined ? { active } : {}),
+        ...(body.data.stock !== undefined ? { stock: body.data.stock } : {}),
+        ...(body.data.cbmPerUnit !== undefined ? { cbmPerUnit: body.data.cbmPerUnit } : {}),
+        ...(body.data.weightKgPerUnit !== undefined ? { weightKgPerUnit: body.data.weightKgPerUnit } : {}),
+        ...(body.data.originHub !== undefined ? { originHub: body.data.originHub } : {}),
+        ...(body.data.leadTimeMin !== undefined ? { leadTimeMin: body.data.leadTimeMin } : {}),
+        ...(body.data.leadTimeMax !== undefined ? { leadTimeMax: body.data.leadTimeMax } : {}),
+        ...(body.data.packagingType !== undefined ? { packagingType: body.data.packagingType } : {}),
+        ...(body.data.defaultIncoterm !== undefined ? { defaultIncoterm: body.data.defaultIncoterm } : {}),
+        ...(body.data.parcelTypeId !== undefined ? { parcelTypeId: body.data.parcelTypeId } : {}),
+        ...(body.data.imageUrl !== undefined ? { imageUrl: body.data.imageUrl } : {}),
+        ...(moderationStatus !== undefined ? { moderationStatus } : {}),
+        ...(body.data.flagReason !== undefined ? { flagReason: body.data.flagReason } : {}),
       },
-      _count: { select: { orderItems: true, reviews: true } },
-    },
+    });
+
+    if (body.data.mediaUrls) {
+      await tx.productMedia.deleteMany({ where: { productId: p.id } });
+      for (let i = 0; i < body.data.mediaUrls.length; i++) {
+        await tx.productMedia.create({
+          data: { productId: p.id, url: body.data.mediaUrls[i], sortOrder: i },
+        });
+      }
+      if (body.data.imageUrl === undefined && body.data.mediaUrls[0]) {
+        await tx.product.update({ where: { id: p.id }, data: { imageUrl: body.data.mediaUrls[0] } });
+      }
+    }
+
+    return tx.product.findUnique({
+      where: { id: p.id },
+      include: {
+        store: { include: { user: { select: userSelect } } },
+        category: true,
+        brand: true,
+        media: { orderBy: { sortOrder: "asc" } },
+        variants: { orderBy: { createdAt: "asc" } },
+        reviews: {
+          orderBy: { createdAt: "desc" },
+          take: 10,
+          include: { user: { select: userSelect } },
+        },
+        _count: { select: { orderItems: true, reviews: true } },
+      },
+    });
   });
+
+  if (!row) return fail(res, 404, "NOT_FOUND", "Product not found");
   await prisma.auditLog.create({
     data: {
       actorId: req.user!.id,
