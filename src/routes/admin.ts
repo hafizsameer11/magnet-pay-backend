@@ -6,6 +6,7 @@ import { z } from "zod";
 import { mpEmail, notifyConversationPeers, notifyUser, notifyUsers } from "../services/user-notify.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
+import { translateChatText } from "../services/chat-translate.js";
 import {
   DEFAULT_ESTIMATE_DISCLAIMER,
   DEFAULT_FREIGHT_PRICING,
@@ -276,12 +277,19 @@ messagesRouter.post("/conversations", requireAuth, async (req, res) => {
 });
 
 messagesRouter.get("/conversations/:id/messages", requireAuth, async (req, res) => {
+  const me = req.user!.id;
+  const conversationId = String(param(req, "id"));
   const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId: param(req, "id"), userId: req.user!.id },
+    where: { conversationId, userId: me },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
+  const peerPart = await prisma.conversationParticipant.findFirst({
+    where: { conversationId, userId: { not: me } },
+    select: { lastReadAt: true },
+  });
+  const peerLastRead = peerPart?.lastReadAt ?? null;
   const messages = await prisma.message.findMany({
-    where: { conversationId: param(req, "id") },
+    where: { conversationId },
     orderBy: { createdAt: "asc" },
     include: {
       quote: {
@@ -292,7 +300,44 @@ messagesRouter.get("/conversations/:id/messages", requireAuth, async (req, res) 
       },
     },
   });
-  return ok(res, serialize(messages));
+  const rows = messages.map((m) => ({
+    ...m,
+    readByPeer:
+      m.senderId === me ? (peerLastRead ? peerLastRead >= m.createdAt : false) : undefined,
+  }));
+  return ok(res, serialize(rows));
+});
+
+messagesRouter.post("/conversations/:id/read", requireAuth, async (req, res) => {
+  const conversationId = String(param(req, "id"));
+  const part = await prisma.conversationParticipant.findFirst({
+    where: { conversationId, userId: req.user!.id },
+  });
+  if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
+  const now = new Date();
+  await prisma.conversationParticipant.update({
+    where: { id: part.id },
+    data: { lastReadAt: now },
+  });
+  return ok(res, { readAt: now.toISOString() });
+});
+
+messagesRouter.post("/translate", requireAuth, async (req, res) => {
+  const body = z
+    .object({
+      text: z.string().min(1).max(4000),
+      targetLang: z.enum(["en", "zh"]).optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "text required");
+  try {
+    const result = await translateChatText(body.data.text, body.data.targetLang);
+    return ok(res, result);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Translation failed";
+    const code = msg.includes("OPENAI_API_KEY") ? 503 : 502;
+    return fail(res, code, "TRANSLATE_FAILED", msg);
+  }
 });
 
 messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res) => {

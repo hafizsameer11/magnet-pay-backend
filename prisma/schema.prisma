@@ -1016,6 +1016,7 @@ model ConversationParticipant {
   muted          Boolean      @default(false)
   archivedAt     DateTime?
   hiddenAt       DateTime?
+  lastReadAt     DateTime?
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
