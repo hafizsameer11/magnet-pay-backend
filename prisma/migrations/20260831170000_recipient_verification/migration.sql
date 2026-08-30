@@ -1,0 +1,5 @@
+ALTER TABLE `Recipient`
+  ADD COLUMN `verificationStatus` ENUM('PENDING', 'VERIFIED', 'MISMATCH', 'FAILED') NOT NULL DEFAULT 'PENDING',
+  ADD COLUMN `verifiedAccountName` VARCHAR(191) NULL,
+  ADD COLUMN `verificationMessage` VARCHAR(191) NULL,
+  ADD COLUMN `verifiedAt` DATETIME(3) NULL;

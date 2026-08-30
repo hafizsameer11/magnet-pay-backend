@@ -79,24 +79,25 @@ cp .env.example .env
 
 ### 2. Database
 
-Use managed MySQL or self-hosted. Then:
-
-```bash
-npx prisma db push
-npm run db:seed
-```
-
-For migrations in CI/prod prefer:
+Use managed MySQL or self-hosted, then apply migrations:
 
 ```bash
 npm run db:migrate
 ```
 
+Do **not** run `db:seed` on production — it resets demo users and catalog data. The API bootstraps default FX rates on startup.
+
+For local development only:
+
+```bash
+npx prisma db push   # or db:migrate:dev
+npm run db:seed
+```
+
 ### 3. Run
 
 ```bash
-npm run build   # if you add a build step
-npm start       # tsx src/index.ts
+npm start
 ```
 
 Use **PM2**, **systemd**, or Docker behind nginx/Caddy with HTTPS.
@@ -136,7 +137,8 @@ Expo dashboard must have **FCM v1 service account key** (Android) and **APNs** (
 |--------|---------|
 | `npm run dev` | Dev server with watch |
 | `npm start` | Production start |
-| `npm run db:seed` | Reset + seed demo data |
+| `npm run db:migrate` | Apply migrations (production) |
+| `npm run db:seed` | Local only — reset + seed demo data |
 | `npm run seed:media` | Download seed images into `seed-media/` |
 | `npm run db:studio` | Prisma Studio |
 

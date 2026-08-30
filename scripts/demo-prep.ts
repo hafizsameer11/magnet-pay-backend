@@ -1,6 +1,6 @@
 /**
- * One-shot prep for demo testing — sync FX, relax tier gates, ensure fee config.
- * Run on server: npx tsx scripts/demo-prep.ts
+ * Optional local demo helper — sync FX and relax tier gates.
+ * Not required for production; the API bootstraps FX rates on startup.
  */
 import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
