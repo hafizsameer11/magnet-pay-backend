@@ -73,6 +73,23 @@ async function dailyDisputesSeries(days = 7) {
   );
 }
 
+async function dailyKycSeries(days = 7) {
+  const since = daysAgo(days);
+  const rows = await prisma.kycApplication.findMany({
+    where: { createdAt: { gte: since } },
+    select: { createdAt: true },
+  });
+  const byDay = new Map<string, number>();
+  for (const k of rows) {
+    const key = k.createdAt.toISOString().slice(0, 10);
+    byDay.set(key, (byDay.get(key) ?? 0) + 1);
+  }
+  return seriesFromDaily(
+    [...byDay.entries()].map(([day, value]) => ({ day, value })),
+    days,
+  );
+}
+
 async function dailyFxVolumeSeries(days = 7) {
   const since = daysAgo(days);
   const rows = await prisma.fxConversion.findMany({
@@ -118,6 +135,7 @@ export async function getAdminAnalyticsOverview() {
     fx24h,
     kycPending,
     kycOverSla,
+    kybPending,
     signups24h,
     signupsToday,
     withdrawalsPending,
@@ -149,6 +167,7 @@ export async function getAdminAnalyticsOverview() {
     prisma.kycApplication.count({
       where: { status: { in: ["SUBMITTED", "DRAFT"] }, updatedAt: { lt: slaCutoff } },
     }),
+    prisma.businessProfile.count({ where: { status: { in: ["SUBMITTED", "DRAFT"] } } }),
     prisma.user.count({ where: { createdAt: { gte: since24h } } }),
     prisma.user.count({ where: { createdAt: { gte: startOfToday } } }),
     prisma.withdrawal.count({ where: { status: { in: ["PENDING", "PROCESSING"] } } }),
@@ -156,7 +175,7 @@ export async function getAdminAnalyticsOverview() {
     prisma.product.count({ where: { moderationStatus: { in: ["PENDING", "REPORTED"] } } }),
   ]);
 
-  const [gmvAgg, gmv24hAgg, gmvPrev24hAgg, fxVolume24hAgg, fxVolumePrev24hAgg, gmvSparkline, signupsSparkline, disputesSparkline, fxSparkline, recentAudit] =
+  const [gmvAgg, gmv24hAgg, gmvPrev24hAgg, fxVolume24hAgg, fxVolumePrev24hAgg, gmvSparkline, signupsSparkline, disputesSparkline, fxSparkline, kycSparkline, recentAudit, fxRates, fxPairs24h] =
     await Promise.all([
       prisma.marketOrder.aggregate({
         where: { createdAt: { gte: since30 }, status: { notIn: ["DRAFT", "CANCELLED"] } },
@@ -185,10 +204,18 @@ export async function getAdminAnalyticsOverview() {
       dailySignupsSeries(7),
       dailyDisputesSeries(7),
       dailyFxVolumeSeries(7),
+      dailyKycSeries(7),
       prisma.auditLog.findMany({
         orderBy: { createdAt: "desc" },
         take: 12,
         include: { actor: { select: { id: true, name: true, email: true } } },
+      }),
+      prisma.fxRate.findMany({ orderBy: { pair: "asc" }, take: 6 }),
+      prisma.fxConversion.groupBy({
+        by: ["fromCurrency", "toCurrency"],
+        where: { createdAt: { gte: since24h } },
+        _sum: { fromMinor: true },
+        _count: true,
       }),
     ]);
 
@@ -203,7 +230,14 @@ export async function getAdminAnalyticsOverview() {
     where: { createdAt: { gte: since30 } },
   });
 
-  type AlertRow = { id: string; severity: "critical" | "high" | "medium"; title: string; detail: string; href: string };
+  type AlertRow = {
+    id: string;
+    severity: "critical" | "high" | "medium";
+    title: string;
+    detail: string;
+    href: string;
+    icon: "gavel" | "shield" | "coins" | "truck" | "wallet" | "file" | "tag";
+  };
   const alerts: AlertRow[] = [];
   if (disputesOpen > 0) {
     alerts.push({
@@ -212,6 +246,7 @@ export async function getAdminAnalyticsOverview() {
       title: `${disputesOpen} open dispute${disputesOpen === 1 ? "" : "s"}`,
       detail: disputesOpenPrev > 0 ? `${disputesOpenPrev} open >24h` : "Needs review",
       href: "/admin/disputes",
+      icon: "gavel",
     });
   }
   if (kycOverSla > 0) {
@@ -221,6 +256,7 @@ export async function getAdminAnalyticsOverview() {
       title: `${kycOverSla} KYC over SLA`,
       detail: `${kycPending} total pending`,
       href: "/admin/kyc",
+      icon: "file",
     });
   } else if (kycPending > 0) {
     alerts.push({
@@ -229,6 +265,7 @@ export async function getAdminAnalyticsOverview() {
       title: `${kycPending} pending KYC`,
       detail: "Review queue",
       href: "/admin/kyc",
+      icon: "file",
     });
   }
   if (withdrawalsPending > 0) {
@@ -238,6 +275,7 @@ export async function getAdminAnalyticsOverview() {
       title: `${withdrawalsPending} withdrawal${withdrawalsPending === 1 ? "" : "s"} pending`,
       detail: "Treasury approval",
       href: "/admin/withdrawals",
+      icon: "wallet",
     });
   }
   if (shipmentsTopUp > 0) {
@@ -247,6 +285,7 @@ export async function getAdminAnalyticsOverview() {
       title: `${shipmentsTopUp} shipment${shipmentsTopUp === 1 ? "" : "s"} need top-up`,
       detail: "Buyer balance due",
       href: "/admin/shipments",
+      icon: "truck",
     });
   }
   if (listingsPending > 0) {
@@ -256,25 +295,52 @@ export async function getAdminAnalyticsOverview() {
       title: `${listingsPending} listing${listingsPending === 1 ? "" : "s"} awaiting moderation`,
       detail: "Catalog review",
       href: "/admin/listings/pending",
+      icon: "tag",
     });
   }
 
   const liveActivity = recentAudit.map((row) => {
-    const who = row.actor?.email ?? row.actor?.name ?? "System";
+    const who = row.actor?.email ?? row.actor?.name ?? "system";
     const action = row.action.replace(/\./g, " ");
     const entity = row.entityId ? `${row.entity} ${row.entityId.slice(0, 8)}` : row.entity;
+    const lower = row.action.toLowerCase();
     return {
       id: row.id,
       at: row.createdAt.toISOString(),
-      text: `${who} · ${action} · ${entity}`,
+      text: `${who} ${action} ${entity}`.replace(/\s+/g, " ").trim(),
       tone:
-        row.action.includes("reject") || row.action.includes("suspend")
+        lower.includes("reject") || lower.includes("suspend") || lower.includes("refund")
           ? "danger"
-          : row.action.includes("approve") || row.action.includes("release")
+          : lower.includes("approve") || lower.includes("release")
             ? "success"
-            : "info",
+            : lower.includes("pause") || lower.includes("flag")
+              ? "warn"
+              : who === "system"
+                ? "neutral"
+                : "info",
     };
   });
+
+  const fxCorridors = fxRates.map((r) => {
+    const [from, to] = r.pair.includes("/") ? r.pair.split("/") : r.pair.split("_");
+    const vol = fxPairs24h.find((p) => p.fromCurrency === from && p.toCurrency === to);
+    return {
+      pair: `${from} → ${to}`,
+      rate: Number(r.rate),
+      spreadPct: r.spreadBps != null ? Number(r.spreadBps) / 100 : null,
+      volume24h: vol ? Number(vol._sum.fromMinor ?? 0n) / 100 : 0,
+      orders24h: vol?._count ?? 0,
+    };
+  });
+
+  const operationalQueues = [
+    { id: "kyc", label: "KYC review", count: kycPending, href: "/admin/kyc" },
+    { id: "kyb", label: "KYB review", count: kybPending, href: "/admin/kyb" },
+    { id: "withdrawals", label: "Withdrawals", count: withdrawalsPending, href: "/admin/withdrawals" },
+    { id: "disputes", label: "Disputes", count: disputesOpen, href: "/admin/disputes" },
+    { id: "listings", label: "Listing moderation", count: listingsPending, href: "/admin/listings/pending" },
+    { id: "shipments", label: "Shipment top-ups", count: shipmentsTopUp, href: "/admin/shipments" },
+  ].filter((q) => q.count > 0);
 
   return {
     users,
@@ -303,6 +369,7 @@ export async function getAdminAnalyticsOverview() {
     fxVolumePrev24h,
     kycPending,
     kycOverSla,
+    kybPending,
     gmv30d,
     gmv24h,
     gmvPrev24h,
@@ -314,9 +381,12 @@ export async function getAdminAnalyticsOverview() {
       signups: signupsSparkline,
       disputes: disputesSparkline,
       fx: fxSparkline,
+      kyc: kycSparkline,
     },
     alerts,
     liveActivity,
+    fxCorridors,
+    operationalQueues,
   };
 }
 
