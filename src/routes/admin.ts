@@ -555,6 +555,17 @@ adminRouter.post("/kyb/:id/decide", async (req, res) => {
     },
     include: { user: { select: { id: true, name: true, phone: true, email: true } } },
   });
+  if (body.data.status === "APPROVED") {
+    await prisma.sellerStore.updateMany({
+      where: { userId: profile.userId },
+      data: { verified: true },
+    });
+  } else if (body.data.status === "REJECTED") {
+    await prisma.sellerStore.updateMany({
+      where: { userId: profile.userId },
+      data: { verified: false },
+    });
+  }
   await prisma.auditLog.create({
     data: {
       actorId: req.user!.id,

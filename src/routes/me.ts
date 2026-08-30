@@ -7,6 +7,7 @@ import {
   parseDeviceTokens,
 } from "../services/notify.js";
 import { mpEmail, notifyUser } from "../services/user-notify.js";
+import { scheduleKycVerification } from "../services/kyc-verify-job.js";
 
 export const meRouter = Router();
 
@@ -45,13 +46,18 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
   const body = z
     .object({
       type: z.enum(["BVN", "NIN", "CN_ID", "BUSINESS"]),
-      tier: z.number().int().min(1).max(3).default(2),
+      tier: z.number().int().min(1).max(3).default(1),
       payload: z.record(z.any()).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid KYC payload");
 
   const incoming = (body.data.payload ?? {}) as Record<string, unknown>;
+  const number = String(incoming.number ?? "").replace(/\D/g, "");
+  if ((body.data.type === "BVN" || body.data.type === "NIN") && number.length !== 11) {
+    return fail(res, 400, "VALIDATION", `${body.data.type} must be 11 digits`);
+  }
+
   const open = await prisma.kycApplication.findFirst({
     where: {
       userId: req.user!.id,
@@ -63,6 +69,8 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
   const mergedPayload = {
     ...((open?.payload as Record<string, unknown> | null) ?? {}),
     ...incoming,
+    ...(number ? { number } : {}),
+    premblyStatus: "queued",
   };
 
   const app = open
@@ -84,6 +92,10 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
           status: "SUBMITTED",
         },
       });
+
+  if (body.data.type === "BVN" || body.data.type === "NIN") {
+    scheduleKycVerification(app.id);
+  }
 
   return ok(res, serialize(app), open ? 200 : 201);
 });

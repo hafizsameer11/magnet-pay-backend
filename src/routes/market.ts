@@ -13,6 +13,7 @@ import {
   type VariantOptions,
 } from "../services/product-variants.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
+import { requireSellerKyb } from "../services/seller-kyb.js";
 import { advanceShipmentOps } from "../services/shipment-ops.js";
 import {
   orderDocumentsForBuyer,
@@ -138,6 +139,7 @@ marketRouter.get("/products", async (req, res) => {
   const products = await prisma.product.findMany({
     where: {
       active: true,
+      store: { verified: true },
       ...(q ? { title: { contains: q } } : {}),
       ...(category ? { category: { slug: category } } : {}),
       ...(storeId ? { storeId } : {}),
@@ -238,7 +240,7 @@ marketRouter.get("/seller/products", requireAuth, async (req, res) => {
   return ok(res, serialize(products));
 });
 
-marketRouter.post("/seller/products", requireAuth, async (req, res) => {
+marketRouter.post("/seller/products", requireAuth, requireSellerKyb, async (req, res) => {
   const body = z
     .object({
       title: z.string().min(2),
@@ -309,7 +311,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
   return ok(res, serialize(product), 201);
 });
 
-marketRouter.patch("/seller/products/:id", requireAuth, async (req, res) => {
+marketRouter.patch("/seller/products/:id", requireAuth, requireSellerKyb, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NO_STORE", "No seller store");
   const existing = await prisma.product.findFirst({ where: { id: param(req, "id"), storeId: store.id } });
@@ -428,7 +430,7 @@ marketRouter.get("/seller/orders/:id", requireAuth, async (req, res) => {
   return ok(res, serialize(order));
 });
 
-marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
+marketRouter.patch("/seller/orders/:id", requireAuth, requireSellerKyb, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const body = z
@@ -562,7 +564,7 @@ marketRouter.get("/seller/templates", requireAuth, async (req, res) => {
   return ok(res, templates);
 });
 
-marketRouter.put("/seller/templates", requireAuth, async (req, res) => {
+marketRouter.put("/seller/templates", requireAuth, requireSellerKyb, async (req, res) => {
   const body = z.object({ templates: z.array(z.object({ id: z.string(), title: z.string(), body: z.string() })) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid templates");
   await saveSellerMeta(req.user!.id, { templates: body.data.templates });
@@ -580,7 +582,7 @@ marketRouter.get("/seller/orders/:id/documents", requireAuth, async (req, res) =
   return ok(res, serialize(payload));
 });
 
-marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) => {
+marketRouter.post("/seller/orders/:id/documents", requireAuth, requireSellerKyb, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const body = z.object({ kind: z.string(), name: z.string(), url: z.string().min(4) }).safeParse(req.body);
@@ -605,7 +607,7 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) 
   return ok(res, list[list.length - 1], 201);
 });
 
-marketRouter.post("/seller/orders/:id/documents/send", requireAuth, async (req, res) => {
+marketRouter.post("/seller/orders/:id/documents/send", requireAuth, requireSellerKyb, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const order = await prisma.marketOrder.findFirst({
@@ -1312,7 +1314,7 @@ marketRouter.get("/seller/team", requireAuth, async (req, res) => {
   });
 });
 
-marketRouter.post("/seller/team", requireAuth, async (req, res) => {
+marketRouter.post("/seller/team", requireAuth, requireSellerKyb, async (req, res) => {
   const body = z
     .object({
       phone: z.string().min(8).optional(),
@@ -1407,7 +1409,7 @@ marketRouter.get("/seller/fapiao", requireAuth, async (req, res) => {
   return ok(res, serialize(rows));
 });
 
-marketRouter.post("/seller/fapiao", requireAuth, async (req, res) => {
+marketRouter.post("/seller/fapiao", requireAuth, requireSellerKyb, async (req, res) => {
   const body = z
     .object({
       orderId: z.string().uuid().optional(),
@@ -1526,7 +1528,7 @@ marketRouter.get("/rfq/:id", requireAuth, async (req, res) => {
   return ok(res, serialize(rfq));
 });
 
-marketRouter.post("/rfq/:id/quotes", requireAuth, async (req, res) => {
+marketRouter.post("/rfq/:id/quotes", requireAuth, requireSellerKyb, async (req, res) => {
   const body = z
     .object({
       amountMinor: z.union([z.string(), z.number()]),
