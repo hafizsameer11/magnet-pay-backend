@@ -637,3 +637,189 @@ export async function getShipmentStats() {
   ]);
   return { total, inTransit, delivered30d: delivered, exceptions };
 }
+
+function sellerTierLabel(verified: boolean, orders30d: number, productCount: number) {
+  if (verified && orders30d >= 100) return "PLATINUM";
+  if (verified && orders30d >= 30) return "GOLD";
+  if (verified) return "SILVER";
+  if (productCount > 0) return "BRONZE";
+  return "NEW";
+}
+
+function sellerStatusLabel(input: {
+  verified: boolean;
+  kybStatus?: string;
+  orders30d: number;
+  rating: number;
+  disputePct: number;
+  disputes: number;
+}) {
+  if (input.kybStatus === "REJECTED") return "BLOCKED";
+  if (input.disputePct >= 3 || (!input.verified && input.disputes > 0)) return "HIGH RISK";
+  if (input.verified && input.rating >= 4.5 && input.orders30d >= 40) return "TOP SELLER";
+  if (input.verified) return "ACTIVE";
+  return "PENDING";
+}
+
+function countryCodeFromPhone(phone: string) {
+  const p = phone.replace(/\s/g, "");
+  if (p.startsWith("+86") || p.startsWith("86")) return "CN";
+  if (p.startsWith("+234") || p.startsWith("234")) return "NG";
+  if (p.startsWith("+233") || p.startsWith("233")) return "GH";
+  return "—";
+}
+
+export async function listAdminSellersWithMetrics() {
+  const since30 = daysAgo(30);
+  const stores = await prisma.sellerStore.findMany({
+    include: {
+      user: { select: { id: true, name: true, phone: true, email: true } },
+      _count: { select: { products: true } },
+    },
+    orderBy: { createdAt: "desc" },
+    take: 200,
+  });
+
+  if (!stores.length) {
+    return {
+      summary: { activeSellers: 0, gmv30dMinor: "0", avgRating: 0, flaggedBlocked: 0 },
+      sellers: [],
+    };
+  }
+
+  const storeIds = stores.map((s) => s.id);
+  const userIds = stores.map((s) => s.userId);
+
+  const [products, kybRows, reviewGroups, items30, disputeGroups] = await Promise.all([
+    prisma.product.findMany({
+      where: { storeId: { in: storeIds } },
+      select: { id: true, storeId: true },
+    }),
+    prisma.businessProfile.findMany({
+      where: { userId: { in: userIds } },
+      select: { userId: true, status: true },
+    }),
+    prisma.review.groupBy({
+      by: ["productId"],
+      where: { product: { storeId: { in: storeIds } } },
+      _avg: { rating: true },
+      _count: { _all: true },
+    }),
+    prisma.orderItem.findMany({
+      where: {
+        product: { storeId: { in: storeIds } },
+        order: { createdAt: { gte: since30 }, status: { notIn: ["DRAFT", "CANCELLED"] } },
+      },
+      select: { productId: true, qty: true, priceMinor: true },
+    }),
+    prisma.dispute.groupBy({
+      by: ["escrowId"],
+      where: { escrow: { sellerId: { in: userIds } } },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const productStore = new Map(products.map((p) => [p.id, p.storeId]));
+  const kybByUser = new Map(kybRows.map((k) => [k.userId, k.status]));
+  const reviewsByStore = new Map<string, { sum: number; count: number }>();
+  for (const rg of reviewGroups) {
+    const storeId = productStore.get(rg.productId);
+    if (!storeId) continue;
+    const prev = reviewsByStore.get(storeId) ?? { sum: 0, count: 0 };
+    const c = rg._count._all;
+    prev.sum += (rg._avg.rating ?? 0) * c;
+    prev.count += c;
+    reviewsByStore.set(storeId, prev);
+  }
+
+  const orders30ByStore = new Map<string, number>();
+  const gmv30ByStore = new Map<string, bigint>();
+  for (const item of items30) {
+    const storeId = productStore.get(item.productId);
+    if (!storeId) continue;
+    orders30ByStore.set(storeId, (orders30ByStore.get(storeId) ?? 0) + item.qty);
+    const line = item.priceMinor * BigInt(item.qty);
+    gmv30ByStore.set(storeId, (gmv30ByStore.get(storeId) ?? 0n) + line);
+  }
+
+  const escrows = await prisma.escrow.findMany({
+    where: { sellerId: { in: userIds } },
+    select: { id: true, sellerId: true },
+  });
+  const escrowSeller = new Map(escrows.map((e) => [e.id, e.sellerId]));
+  const disputesByUser = new Map<string, number>();
+  for (const d of disputeGroups) {
+    const sellerId = escrowSeller.get(d.escrowId);
+    if (!sellerId) continue;
+    disputesByUser.set(sellerId, (disputesByUser.get(sellerId) ?? 0) + d._count._all);
+  }
+
+  let totalGmv30 = 0n;
+  let ratingSum = 0;
+  let ratingCount = 0;
+  let flaggedBlocked = 0;
+
+  const sellers = stores.map((store) => {
+    const orders30d = orders30ByStore.get(store.id) ?? 0;
+    const gmv30Minor = gmv30ByStore.get(store.id) ?? 0n;
+    totalGmv30 += gmv30Minor;
+
+    const rev = reviewsByStore.get(store.id);
+    const rating = rev && rev.count ? Math.round((rev.sum / rev.count) * 100) / 100 : 0;
+    const reviewCount = rev?.count ?? 0;
+    if (reviewCount) {
+      ratingSum += rating * reviewCount;
+      ratingCount += reviewCount;
+    }
+
+    const disputes = disputesByUser.get(store.userId) ?? 0;
+    const disputePct = pct(disputes, Math.max(orders30d, 1));
+    const kybStatus = kybByUser.get(store.userId);
+    const tier = sellerTierLabel(store.verified, orders30d, store._count.products);
+    const status = sellerStatusLabel({
+      verified: store.verified,
+      kybStatus,
+      orders30d,
+      rating,
+      disputePct,
+      disputes,
+    });
+
+    if (status === "BLOCKED" || status === "HIGH RISK") flaggedBlocked++;
+
+    return {
+      id: store.id,
+      name: store.name,
+      description: store.description,
+      bannerUrl: store.bannerUrl,
+      logoUrl: store.logoUrl,
+      verified: store.verified,
+      createdAt: store.createdAt,
+      user: store.user,
+      _count: store._count,
+      country: countryCodeFromPhone(store.user.phone),
+      tier,
+      rating,
+      reviewCount,
+      orders30d,
+      gmv30Minor: gmv30Minor.toString(),
+      disputePct,
+      disputes,
+      status,
+      kybStatus: kybStatus ?? "DRAFT",
+    };
+  });
+
+  const activeSellers = sellers.filter((s) => s.verified && s.status !== "BLOCKED").length;
+  const avgRating = ratingCount ? Math.round((ratingSum / ratingCount) * 100) / 100 : 0;
+
+  return {
+    summary: {
+      activeSellers,
+      gmv30dMinor: totalGmv30.toString(),
+      avgRating,
+      flaggedBlocked,
+    },
+    sellers,
+  };
+}

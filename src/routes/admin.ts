@@ -1260,12 +1260,9 @@ adminRouter.patch("/categories/:id", async (req, res) => {
 });
 
 adminRouter.get("/sellers", async (_req, res) => {
-  const rows = await prisma.sellerStore.findMany({
-    include: { user: { select: userSelect }, _count: { select: { products: true } } },
-    orderBy: { createdAt: "desc" },
-    take: 200,
-  });
-  return ok(res, serialize(rows));
+  const { listAdminSellersWithMetrics } = await import("../services/admin-analytics.js");
+  const data = await listAdminSellersWithMetrics();
+  return ok(res, serialize(data));
 });
 
 adminRouter.get("/sellers/:id", async (req, res) => {
