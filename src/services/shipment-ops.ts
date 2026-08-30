@@ -6,7 +6,7 @@ import {
   recordTx,
   unlockHoldCashback,
 } from "./ledger.js";
-import { notifyUserEmail } from "./notify.js";
+import { mpEmail, notifyUser } from "./user-notify.js";
 
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0];
 
@@ -162,13 +162,6 @@ async function syncOrderLogisticsFromShipment(tx: TxClient, shipmentId: string, 
       where: { escrowId: order.escrowId, status: "FUNDED", releaseRequestedAt: null },
       data: { releaseRequestedAt: new Date() },
     });
-    await tx.notification.create({
-      data: {
-        userId: order.userId,
-        title: "Delivery confirmed",
-        body: "You confirmed receipt. You can now release escrow funds when ready.",
-      },
-    });
   }
 }
 
@@ -254,16 +247,31 @@ export async function advanceShipmentOps(input: {
   });
 
   if (input.notify !== false) {
-    const user = await prisma.user.findUnique({
-      where: { id: shipment.userId },
-      select: { email: true, name: true, notificationPrefs: true },
+    const statusLabel = status.replace(/_/g, " ").toLowerCase();
+    notifyUser(shipment.userId, {
+      title: `Shipment update · ${shipment.ref}`,
+      body: `Your shipment is now ${statusLabel}.${input.message ? ` ${input.message}` : ""}`,
+      href: `/logistics/shipments/${shipment.id}`,
+      emailPref: "emailShipments",
+      emailSubject: `Shipment update · ${shipment.ref}`,
+      emailText: mpEmail(null, [
+        `Shipment ${shipment.ref} is now ${statusLabel}.`,
+        input.message ?? "",
+      ].filter(Boolean)),
     });
-    notifyUserEmail(
-      user,
-      "emailShipments",
-      `Shipment update · ${shipment.ref}`,
-      `Hi ${user?.name ?? "there"},\n\nShipment ${shipment.ref} is now ${status.replace(/_/g, " ").toLowerCase()}.\n\n— MagnetPay`,
-    );
+    if (status === "DELIVERED") {
+      notifyUser(shipment.userId, {
+        title: "Delivery confirmed",
+        body: "You confirmed receipt. You can now release escrow funds when ready.",
+        href: shipment.marketOrder?.id ? `/market/order/${shipment.marketOrder.id}` : `/logistics/shipments/${shipment.id}`,
+        emailPref: "emailShipments",
+        emailSubject: `Delivery confirmed · ${shipment.ref}`,
+        emailText: mpEmail(null, [
+          `Delivery for shipment ${shipment.ref} is confirmed.`,
+          "You can release escrow funds when ready.",
+        ]),
+      });
+    }
   }
 
   return updated;
@@ -341,26 +349,10 @@ export async function settleShipmentOps(input: {
         amountPositive: true,
         icon: "ship",
       });
-      await tx.notification.create({
-        data: {
-          userId: shipment.userId,
-          title: "Shipping adjustment refund",
-          body: `Final customs charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You paid ${formatMoney(currency, locked)}. ${formatMoney(currency, cashbackMinor)} was credited to your ₦ wallet.`,
-          href: `/logistics/shipments/${shipment.id}`,
-        },
-      });
     } else if (finalMinor! > locked) {
       topUpMinor = finalMinor! - locked;
       await consumeHold(tx, shipment.userId, currency, locked, "LOGISTICS_HOLD", "Logistics estimated charge");
       nextStatus = "TOP_UP_REQUIRED";
-      await tx.notification.create({
-        data: {
-          userId: shipment.userId,
-          title: "Additional payment required",
-          body: `Your final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You previously paid ${formatMoney(currency, locked)}. Please top up ${formatMoney(currency, topUpMinor)} before your shipment can be collected.`,
-          href: `/logistics/shipments/${shipment.id}`,
-        },
-      });
     } else {
       await consumeHold(tx, shipment.userId, currency, locked, "LOGISTICS_HOLD", "Logistics final charge");
     }
@@ -393,24 +385,36 @@ export async function settleShipmentOps(input: {
   });
 
   if (input.notify !== false) {
-    const user = await prisma.user.findUnique({
-      where: { id: shipment.userId },
-      select: { email: true, name: true, notificationPrefs: true },
-    });
     if (result.settlement.topUpMinor > 0n) {
-      notifyUserEmail(
-        user,
-        "emailShipments",
-        `Additional payment required · ${shipment.ref}`,
-        `Hi ${user?.name ?? "there"},\n\nYour final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.\nYou previously paid ${formatMoney(currency, locked)}.\nPlease top up ${formatMoney(currency, result.settlement.topUpMinor)} before your shipment can be collected.\n\n— MagnetPay`,
-      );
+      notifyUser(shipment.userId, {
+        title: "Additional payment required",
+        body: `Your final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You previously paid ${formatMoney(currency, locked)}. Please top up ${formatMoney(currency, result.settlement.topUpMinor)} before your shipment can be collected.`,
+        href: `/logistics/shipments/${shipment.id}`,
+        emailPref: "emailShipments",
+        emailSubject: `Additional payment required · ${shipment.ref}`,
+        emailText: mpEmail(null, [
+          `Your final customs/shipping charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.`,
+          `You previously paid ${formatMoney(currency, locked)}.`,
+          `Please top up ${formatMoney(currency, result.settlement.topUpMinor)} before your shipment can be collected.`,
+        ]),
+      });
     } else {
-      notifyUserEmail(
-        user,
-        "emailShipments",
-        `Final shipping cost applied · ${shipment.ref}`,
-        `Hi ${user?.name ?? "there"},\n\nFinal clearing cost for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.${result.settlement.cashbackMinor > 0n ? ` ${formatMoney(currency, result.settlement.cashbackMinor)} was credited to your ₦ wallet as a shipping adjustment refund.` : ""}\n\n— MagnetPay`,
-      );
+      notifyUser(shipment.userId, {
+        title: result.settlement.cashbackMinor > 0n ? "Shipping adjustment refund" : "Final shipping cost applied",
+        body:
+          result.settlement.cashbackMinor > 0n
+            ? `Final customs charge for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}. You paid ${formatMoney(currency, locked)}. ${formatMoney(currency, result.settlement.cashbackMinor)} was credited to your ₦ wallet.`
+            : `Final clearing cost for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.`,
+        href: `/logistics/shipments/${shipment.id}`,
+        emailPref: "emailShipments",
+        emailSubject: `Final shipping cost applied · ${shipment.ref}`,
+        emailText: mpEmail(null, [
+          `Final clearing cost for ${shipment.ref} is ${formatMoney(currency, finalMinor!)}.`,
+          ...(result.settlement.cashbackMinor > 0n
+            ? [`${formatMoney(currency, result.settlement.cashbackMinor)} was credited to your ₦ wallet as a shipping adjustment refund.`]
+            : []),
+        ]),
+      });
     }
   }
 

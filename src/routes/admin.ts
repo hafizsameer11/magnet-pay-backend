@@ -2,7 +2,7 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
 import {fail, ok, requireAuth, requireAdmin, serialize, param } from "../lib/http.js";
 import { z } from "zod";
-import { deliverUserNotification } from "../services/deliver.js";
+import { mpEmail, notifyConversationPeers, notifyUser, notifyUsers } from "../services/user-notify.js";
 import { formatMoney } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 import {
@@ -254,6 +254,19 @@ messagesRouter.post("/conversations", requireAuth, async (req, res) => {
       include: { messages: true, participants: true },
     });
   });
+  if (body.data.body) {
+    void notifyConversationPeers(conv!.id, req.user!.id, {
+      title: "New message",
+      body: body.data.body.slice(0, 120),
+      href: `/messages/${conv!.id}`,
+    });
+  } else {
+    notifyUser(body.data.peerUserId, {
+      title: "New conversation",
+      body: body.data.subject ?? "Someone started a chat with you",
+      href: `/messages/${conv!.id}`,
+    });
+  }
   return ok(res, serialize(conv), 201);
 });
 
@@ -304,6 +317,11 @@ messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res)
     where: { id: param(req, "id") },
     data: { updatedAt: new Date() },
   });
+  void notifyConversationPeers(param(req, "id"), req.user!.id, {
+    title: "New message",
+    body: (text || "Attachment").slice(0, 120),
+    href: `/messages/${param(req, "id")}`,
+  });
   return ok(res, serialize(msg), 201);
 });
 
@@ -351,6 +369,13 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
       conversationId: existing.conversationId,
       channel: "in_app",
     }).catch(() => {});
+    if (admin) {
+      notifyUser(admin.id, {
+        title: "Support message",
+        body: `[${body.data.topic}] ${body.data.message.slice(0, 120)}`,
+        href: `/messages/${existing.conversationId}`,
+      });
+    }
     return ok(res, serialize({ conversationId: existing.conversationId, message: msg }));
   }
   const conv = await prisma.$transaction(async (tx) => {
@@ -378,6 +403,11 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
     conversationId: conv.conversationId,
     channel: "in_app",
   }).catch(() => {});
+  notifyUser(admin.id, {
+    title: "New support ticket",
+    body: `[${body.data.topic}] ${body.data.message.slice(0, 120)}`,
+    href: `/messages/${conv.conversationId}`,
+  });
   return ok(res, serialize(conv), 201);
 });
 
@@ -468,17 +498,16 @@ adminRouter.post("/kyc/:id/decide", async (req, res) => {
     select: { id: true, email: true, name: true, notificationPrefs: true, deviceTokens: true },
   });
   const verdict = body.data.status === "APPROVED" ? "approved" : "rejected";
-  void deliverUserNotification(app.userId, {
+  notifyUser(app.userId, {
     title: `KYC ${verdict}`,
     body: body.data.note ? body.data.note : `Your KYC application was ${verdict}.`,
     href: "/kyc-status",
-    email: {
-      prefKey: "emailKyc",
-      subject: `KYC ${verdict}`,
-      text: `Hi ${user?.name || "there"},\n\nYour MagnetPay KYC application was ${verdict}.${
-        body.data.note ? `\n\nNote: ${body.data.note}` : ""
-      }\n\n— MagnetPay`,
-    },
+    emailPref: "emailKyc",
+    emailSubject: `KYC ${verdict}`,
+    emailText: mpEmail(user?.name, [
+      `Your MagnetPay KYC application was ${verdict}.`,
+      ...(body.data.note ? [body.data.note] : []),
+    ]),
   });
   return ok(res, serialize(app));
 });
@@ -540,17 +569,16 @@ adminRouter.post("/kyb/:id/decide", async (req, res) => {
     select: { id: true, email: true, name: true, notificationPrefs: true, deviceTokens: true },
   });
   const verdict = body.data.status === "APPROVED" ? "approved" : "rejected";
-  void deliverUserNotification(profile.userId, {
+  notifyUser(profile.userId, {
     title: `Business verification ${verdict}`,
     body: body.data.note ? body.data.note : `Your KYB verification was ${verdict}.`,
     href: "/kyc-status",
-    email: {
-      prefKey: "emailKyc",
-      subject: `Business verification ${verdict}`,
-      text: `Hi ${user?.name || "there"},\n\nYour MagnetPay business (KYB) verification was ${verdict}.${
-        body.data.note ? `\n\nNote: ${body.data.note}` : ""
-      }\n\n— MagnetPay`,
-    },
+    emailPref: "emailKyc",
+    emailSubject: `Business verification ${verdict}`,
+    emailText: mpEmail(user?.name, [
+      `Your MagnetPay business (KYB) verification was ${verdict}.`,
+      ...(body.data.note ? [body.data.note] : []),
+    ]),
   });
   return ok(res, serialize(profile));
 });
@@ -645,6 +673,18 @@ adminRouter.post("/escrows/:id/resolve", async (req, res) => {
       entityId: escrow.id,
       meta: { outcome: body.data.outcome },
     },
+  });
+  const full = await prisma.escrow.findUnique({
+    where: { id: escrow.id },
+    select: { buyerId: true, sellerId: true, title: true },
+  });
+  notifyUsers([full?.buyerId, full?.sellerId], {
+    title: "Escrow dispute resolved",
+    body: body.data.outcome,
+    href: `/escrow/${escrow.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Escrow dispute resolved",
+    emailText: mpEmail(null, [`Dispute on escrow "${full?.title ?? escrow.id}" was resolved: ${body.data.outcome}`]),
   });
   return ok(res, serialize(escrow));
 });
@@ -841,15 +881,13 @@ adminRouter.post("/withdrawals/:id/decide", async (req, res) => {
   });
   const amount = formatMoney(row.currency, row.amountMinor);
   const verdict = mapped === "SUCCEEDED" ? "approved" : "rejected";
-  void deliverUserNotification(row.userId, {
+  notifyUser(row.userId, {
     title: `Withdrawal ${verdict}`,
     body: `Your withdrawal of ${amount} was ${verdict}.`,
     href: "/notifications",
-    email: {
-      prefKey: "emailTransfers",
-      subject: `Withdrawal ${verdict}`,
-      text: `Hi ${user?.name || "there"},\n\nYour withdrawal of ${amount} was ${verdict}.\n\n— MagnetPay`,
-    },
+    emailPref: "emailTransfers",
+    emailSubject: `Withdrawal ${verdict}`,
+    emailText: mpEmail(user?.name, [`Your withdrawal of ${amount} was ${verdict}.`]),
   });
   return ok(res, serialize(row));
 });
@@ -958,12 +996,13 @@ adminRouter.post("/orders/:id/mark-shipped", async (req, res) => {
     },
   });
 
-  await prisma.notification.create({
-    data: {
-      userId: order.userId,
-      title: "Order marked as shipped",
-      body: `MagnetPay ops marked your order shipped · Tracking: ${tracking}`,
-    },
+  notifyUser(order.userId, {
+    title: "Order marked as shipped",
+    body: `MagnetPay ops marked your order shipped · Tracking: ${tracking}`,
+    href: `/market/order/${order.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Order marked as shipped",
+    emailText: mpEmail(null, [`Your order was marked shipped. Tracking: ${tracking}`]),
   });
 
   if (updated.shipmentId) {
@@ -1062,6 +1101,15 @@ adminRouter.post("/products/:id/moderate", async (req, res) => {
       entityId: row.id,
       meta: { status: body.data.status, active },
     },
+  });
+  const statusLabel = body.data.status ?? moderationStatus;
+  notifyUser(row.store.userId, {
+    title: `Product ${String(statusLabel).toLowerCase()}`,
+    body: row.title,
+    href: `/seller/products/${row.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: `Product ${String(statusLabel).toLowerCase()}`,
+    emailText: mpEmail(null, [`Your product "${row.title}" was ${String(statusLabel).toLowerCase()}.`]),
   });
   return ok(res, serialize(row));
 });
@@ -1417,7 +1465,7 @@ adminRouter.get("/analytics/overview", async (_req, res) => {
 });
 
 adminRouter.post("/push/test", requireAdmin, async (req, res) => {
-  await deliverUserNotification(req.user!.id, {
+  notifyUser(req.user!.id, {
     title: "MagnetPay test push",
     body: "If you see this, Expo FCM + backend push are working.",
     href: "/notifications",

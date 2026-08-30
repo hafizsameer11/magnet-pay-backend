@@ -39,10 +39,65 @@ async function gmvSeries(days = 14) {
   );
 }
 
+async function dailySignupsSeries(days = 7) {
+  const since = daysAgo(days);
+  const rows = await prisma.user.findMany({
+    where: { createdAt: { gte: since } },
+    select: { createdAt: true },
+  });
+  const byDay = new Map<string, number>();
+  for (const u of rows) {
+    const key = u.createdAt.toISOString().slice(0, 10);
+    byDay.set(key, (byDay.get(key) ?? 0) + 1);
+  }
+  return seriesFromDaily(
+    [...byDay.entries()].map(([day, value]) => ({ day, value })),
+    days,
+  );
+}
+
+async function dailyDisputesSeries(days = 7) {
+  const since = daysAgo(days);
+  const rows = await prisma.dispute.findMany({
+    where: { createdAt: { gte: since } },
+    select: { createdAt: true },
+  });
+  const byDay = new Map<string, number>();
+  for (const d of rows) {
+    const key = d.createdAt.toISOString().slice(0, 10);
+    byDay.set(key, (byDay.get(key) ?? 0) + 1);
+  }
+  return seriesFromDaily(
+    [...byDay.entries()].map(([day, value]) => ({ day, value })),
+    days,
+  );
+}
+
+async function dailyFxVolumeSeries(days = 7) {
+  const since = daysAgo(days);
+  const rows = await prisma.fxConversion.findMany({
+    where: { createdAt: { gte: since } },
+    select: { createdAt: true, fromMinor: true },
+  });
+  const byDay = new Map<string, number>();
+  for (const fx of rows) {
+    const key = fx.createdAt.toISOString().slice(0, 10);
+    byDay.set(key, (byDay.get(key) ?? 0) + Number(fx.fromMinor) / 100);
+  }
+  return seriesFromDaily(
+    [...byDay.entries()].map(([day, value]) => ({ day, value })),
+    days,
+  );
+}
+
 export async function getAdminAnalyticsOverview() {
   const since30 = daysAgo(30);
   const since7 = daysAgo(7);
   const since24h = daysAgo(1);
+  const since48h = daysAgo(2);
+  const slaCutoff = daysAgo(3);
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
 
   const [
     users,
@@ -57,10 +112,17 @@ export async function getAdminAnalyticsOverview() {
     shipmentsInTransit,
     delivered30d,
     disputesOpen,
+    disputesOpenPrev,
     productsActive,
     storesVerified,
     fx24h,
     kycPending,
+    kycOverSla,
+    signups24h,
+    signupsToday,
+    withdrawalsPending,
+    shipmentsTopUp,
+    listingsPending,
   ] = await Promise.all([
     prisma.user.count(),
     prisma.user.count({ where: { createdAt: { gte: since30 } } }),
@@ -74,27 +136,152 @@ export async function getAdminAnalyticsOverview() {
     prisma.shipment.count({ where: { status: { in: ["IN_TRANSIT", "CUSTOMS"] } } }),
     prisma.shipment.count({ where: { status: "DELIVERED", updatedAt: { gte: since30 } } }),
     prisma.dispute.count({ where: { status: { in: ["OPEN", "INVESTIGATING"] } } }),
+    prisma.dispute.count({
+      where: {
+        status: { in: ["OPEN", "INVESTIGATING"] },
+        createdAt: { lt: since24h },
+      },
+    }),
     prisma.product.count({ where: { active: true } }),
     prisma.sellerStore.count({ where: { verified: true } }),
     prisma.fxConversion.count({ where: { createdAt: { gte: since24h } } }),
     prisma.kycApplication.count({ where: { status: { in: ["SUBMITTED", "DRAFT"] } } }),
+    prisma.kycApplication.count({
+      where: { status: { in: ["SUBMITTED", "DRAFT"] }, updatedAt: { lt: slaCutoff } },
+    }),
+    prisma.user.count({ where: { createdAt: { gte: since24h } } }),
+    prisma.user.count({ where: { createdAt: { gte: startOfToday } } }),
+    prisma.withdrawal.count({ where: { status: { in: ["PENDING", "PROCESSING"] } } }),
+    prisma.shipment.count({ where: { status: "TOP_UP_REQUIRED" } }),
+    prisma.product.count({ where: { moderationStatus: { in: ["PENDING", "REPORTED"] } } }),
   ]);
 
-  const gmvAgg = await prisma.marketOrder.aggregate({
-    where: { createdAt: { gte: since30 }, status: { notIn: ["DRAFT", "CANCELLED"] } },
-    _sum: { totalMinor: true },
-  });
+  const [gmvAgg, gmv24hAgg, gmvPrev24hAgg, fxVolume24hAgg, fxVolumePrev24hAgg, gmvSparkline, signupsSparkline, disputesSparkline, fxSparkline, recentAudit] =
+    await Promise.all([
+      prisma.marketOrder.aggregate({
+        where: { createdAt: { gte: since30 }, status: { notIn: ["DRAFT", "CANCELLED"] } },
+        _sum: { totalMinor: true },
+      }),
+      prisma.marketOrder.aggregate({
+        where: { createdAt: { gte: since24h }, status: { notIn: ["DRAFT", "CANCELLED"] } },
+        _sum: { totalMinor: true },
+      }),
+      prisma.marketOrder.aggregate({
+        where: {
+          createdAt: { gte: since48h, lt: since24h },
+          status: { notIn: ["DRAFT", "CANCELLED"] },
+        },
+        _sum: { totalMinor: true },
+      }),
+      prisma.fxConversion.aggregate({
+        where: { createdAt: { gte: since24h } },
+        _sum: { fromMinor: true },
+      }),
+      prisma.fxConversion.aggregate({
+        where: { createdAt: { gte: since48h, lt: since24h } },
+        _sum: { fromMinor: true },
+      }),
+      gmvSeries(7),
+      dailySignupsSeries(7),
+      dailyDisputesSeries(7),
+      dailyFxVolumeSeries(7),
+      prisma.auditLog.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 12,
+        include: { actor: { select: { id: true, name: true, email: true } } },
+      }),
+    ]);
+
   const gmv30d = Number(gmvAgg._sum.totalMinor ?? 0n) / 100;
+  const gmv24h = Number(gmv24hAgg._sum.totalMinor ?? 0n) / 100;
+  const gmvPrev24h = Number(gmvPrev24hAgg._sum.totalMinor ?? 0n) / 100;
+  const fxVolume24h = Number(fxVolume24hAgg._sum.fromMinor ?? 0n) / 100;
+  const fxVolumePrev24h = Number(fxVolumePrev24hAgg._sum.fromMinor ?? 0n) / 100;
 
   const buyers30d = await prisma.marketOrder.groupBy({
     by: ["userId"],
     where: { createdAt: { gte: since30 } },
   });
 
+  type AlertRow = { id: string; severity: "critical" | "high" | "medium"; title: string; detail: string; href: string };
+  const alerts: AlertRow[] = [];
+  if (disputesOpen > 0) {
+    alerts.push({
+      id: "disputes",
+      severity: disputesOpen >= 5 ? "critical" : "high",
+      title: `${disputesOpen} open dispute${disputesOpen === 1 ? "" : "s"}`,
+      detail: disputesOpenPrev > 0 ? `${disputesOpenPrev} open >24h` : "Needs review",
+      href: "/admin/disputes",
+    });
+  }
+  if (kycOverSla > 0) {
+    alerts.push({
+      id: "kyc-sla",
+      severity: "high",
+      title: `${kycOverSla} KYC over SLA`,
+      detail: `${kycPending} total pending`,
+      href: "/admin/kyc",
+    });
+  } else if (kycPending > 0) {
+    alerts.push({
+      id: "kyc",
+      severity: "medium",
+      title: `${kycPending} pending KYC`,
+      detail: "Review queue",
+      href: "/admin/kyc",
+    });
+  }
+  if (withdrawalsPending > 0) {
+    alerts.push({
+      id: "withdrawals",
+      severity: "high",
+      title: `${withdrawalsPending} withdrawal${withdrawalsPending === 1 ? "" : "s"} pending`,
+      detail: "Treasury approval",
+      href: "/admin/withdrawals",
+    });
+  }
+  if (shipmentsTopUp > 0) {
+    alerts.push({
+      id: "topup",
+      severity: "medium",
+      title: `${shipmentsTopUp} shipment${shipmentsTopUp === 1 ? "" : "s"} need top-up`,
+      detail: "Buyer balance due",
+      href: "/admin/shipments",
+    });
+  }
+  if (listingsPending > 0) {
+    alerts.push({
+      id: "listings",
+      severity: "medium",
+      title: `${listingsPending} listing${listingsPending === 1 ? "" : "s"} awaiting moderation`,
+      detail: "Catalog review",
+      href: "/admin/listings/pending",
+    });
+  }
+
+  const liveActivity = recentAudit.map((row) => {
+    const who = row.actor?.email ?? row.actor?.name ?? "System";
+    const action = row.action.replace(/\./g, " ");
+    const entity = row.entityId ? `${row.entity} ${row.entityId.slice(0, 8)}` : row.entity;
+    return {
+      id: row.id,
+      at: row.createdAt.toISOString(),
+      text: `${who} · ${action} · ${entity}`,
+      tone:
+        row.action.includes("reject") || row.action.includes("suspend")
+          ? "danger"
+          : row.action.includes("approve") || row.action.includes("release")
+            ? "success"
+            : "info",
+    };
+  });
+
   return {
     users,
     users30d,
     signups7d,
+    signups24h,
+    signupsToday,
     activeBuyers30d: buyers30d.length,
     wallets: {
       balanceMinorSum: walletAgg._sum.balanceMinor ?? 0n,
@@ -108,14 +295,28 @@ export async function getAdminAnalyticsOverview() {
     shipmentsInTransit,
     delivered30d,
     disputesOpen,
+    disputesOpenPrev,
     listingsLive: productsActive,
     verifiedStores: storesVerified,
     fxOrders24h: fx24h,
+    fxVolume24h,
+    fxVolumePrev24h,
     kycPending,
+    kycOverSla,
     gmv30d,
+    gmv24h,
+    gmvPrev24h,
     gmv30dFormatted: gmv30d,
     takeRate: 0.9,
     disputeRate: orders > 0 ? pct(disputesOpen, orders) : 0,
+    sparklines: {
+      gmv: gmvSparkline,
+      signups: signupsSparkline,
+      disputes: disputesSparkline,
+      fx: fxSparkline,
+    },
+    alerts,
+    liveActivity,
   };
 }
 

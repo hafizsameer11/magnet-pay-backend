@@ -9,7 +9,7 @@ import {
   debitWallet,
 } from "../services/ledger.js";
 import { dutyPctForDestination, getHsCode, searchHsCodes } from "../data/hs-codes.js";
-import { notifyUserEmail } from "../services/notify.js";
+import { mpEmail, notifyConversationPeers, notifyUser } from "../services/user-notify.js";
 import { estimateQuoteFromParcelType, estimateQuoteMinor, getLogisticsEstimateConfig, listActiveParcelTypes } from "../services/freight-pricing.js";
 import { generatePartnerQuotes, serializeQuoteForCompare } from "../services/partner-quotes.js";
 import { inferParcelTypeForOrder } from "../services/parcel-type-infer.js";
@@ -348,15 +348,19 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
     });
     const user = await prisma.user.findUnique({
       where: { id: req.user!.id },
-      select: { email: true, name: true, notificationPrefs: true },
+      select: { name: true },
     });
     if (shipment) {
-      notifyUserEmail(
-        user,
-        "emailShipments",
-        `Shipment booked · ${shipment.ref}`,
-        `Hi ${user?.name ?? "there"},\n\nYour shipment ${shipment.ref} (${shipment.route}) is booked and the quote amount is on hold.\n\n— MagnetPay`,
-      );
+      notifyUser(req.user!.id, {
+        title: `Shipment booked · ${shipment.ref}`,
+        body: `Your shipment ${shipment.ref} (${shipment.route}) is booked and the quote amount is on hold.`,
+        href: `/logistics/shipments/${shipment.id}`,
+        emailPref: "emailShipments",
+        emailSubject: `Shipment booked · ${shipment.ref}`,
+        emailText: mpEmail(user?.name, [
+          `Your shipment ${shipment.ref} (${shipment.route}) is booked and the quote amount is on hold.`,
+        ]),
+      });
     }
     return ok(res, serialize(shipment), 201);
   } catch (e) {
@@ -455,19 +459,19 @@ logisticsRouter.post("/shipments/:id/top-up", requireAuth, async (req, res) => {
       await tx.shipmentEvent.create({
         data: { shipmentId: shipment.id, status: "READY_FOR_POD", message: "Top-up paid" },
       });
-      await tx.notification.create({
-        data: {
-          userId: req.user!.id,
-          title: "Top-up received",
-          body: `You can now confirm delivery for ${shipment.ref}.`,
-          href: `/logistics/shipments/${shipment.id}`,
-        },
-      });
       return tx.shipment.update({
         where: { id: shipment.id },
         data: { status: "READY_FOR_POD" },
         include: { settlement: true, events: true },
       });
+    });
+    notifyUser(req.user!.id, {
+      title: "Top-up received",
+      body: `You can now confirm delivery for ${shipment.ref}.`,
+      href: `/logistics/shipments/${shipment.id}`,
+      emailPref: "emailShipments",
+      emailSubject: `Top-up received · ${shipment.ref}`,
+      emailText: mpEmail(null, [`Top-up for ${shipment.ref} received. You can now confirm delivery.`]),
     });
     return ok(res, serialize(updated));
   } catch (e) {
@@ -509,14 +513,15 @@ logisticsRouter.post("/shipments/:id/claim", requireAuth, async (req, res) => {
         message: `Claim filed (${body.data.type}): ${body.data.description.slice(0, 120)}`,
       },
     });
-    await tx.notification.create({
-      data: {
-        userId: req.user!.id,
-        title: "Claim submitted",
-        body: `${shipment.ref} · ${body.data.type}`,
-      },
-    });
     return claim;
+  });
+  notifyUser(req.user!.id, {
+    title: "Claim submitted",
+    body: `${shipment.ref} · ${body.data.type}`,
+    href: `/logistics/shipments/${shipment.id}`,
+    emailPref: "emailShipments",
+    emailSubject: `Claim submitted · ${shipment.ref}`,
+    emailText: mpEmail(null, [`Your claim (${body.data.type}) for ${shipment.ref} was submitted.`]),
   });
   return ok(res, serialize({ claim: result, shipmentId: shipment.id, ref: shipment.ref }), 201);
 });

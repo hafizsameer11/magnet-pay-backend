@@ -10,7 +10,7 @@ import {
   recordTx,
 } from "../services/ledger.js";
 import { getNombaProvider } from "../services/nomba.js";
-import { deliverUserNotification } from "../services/deliver.js";
+import { mpEmail, notifyUser } from "../services/user-notify.js";
 import { assertWithinDailyLimit, getWalletLimits } from "../services/limits.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
 
@@ -133,6 +133,16 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
       });
       return { deposit, transaction };
     });
+    notifyUser(req.user!.id, {
+      title: "Wallet funded",
+      body: `+${formatMoney(body.data.currency, amountMinor)} via ${body.data.method}`,
+      href: "/wallet",
+      emailPref: "emailTransfers",
+      emailSubject: "Wallet funded",
+      emailText: mpEmail(user?.name, [
+        `Your wallet was credited with ${formatMoney(body.data.currency, amountMinor)}.`,
+      ]),
+    });
     const digits = (user?.id ?? "").replace(/\D/g, "").padEnd(10, "0").slice(0, 10);
     return ok(
       res,
@@ -215,6 +225,16 @@ walletsRouter.post("/withdraw", requireAuth, async (req, res) => {
         icon: "arrow-up-right",
       });
       return w;
+    });
+    notifyUser(req.user!.id, {
+      title: "Withdrawal submitted",
+      body: `−${formatMoney(body.data.currency, amountMinor)} to ${body.data.destination}`,
+      href: "/wallet",
+      emailPref: "emailTransfers",
+      emailSubject: "Withdrawal submitted",
+      emailText: mpEmail(null, [
+        `Your withdrawal of ${formatMoney(body.data.currency, amountMinor)} was submitted.`,
+      ]),
     });
     return ok(res, serialize(result), 201);
   } catch (e) {
@@ -321,6 +341,16 @@ walletsRouter.post("/fx/convert", requireAuth, async (req, res) => {
       });
       return row;
     });
+    notifyUser(req.user!.id, {
+      title: "Currency converted",
+      body: `${formatMoney(body.data.from as Currency, fromMinor)} → ${formatMoney(body.data.to as Currency, quoteRes.toMinor)}`,
+      href: "/wallet",
+      emailPref: "emailTransfers",
+      emailSubject: "Currency converted",
+      emailText: mpEmail(null, [
+        `Converted ${formatMoney(body.data.from as Currency, fromMinor)} to ${formatMoney(body.data.to as Currency, quoteRes.toMinor)}.`,
+      ]),
+    });
     return ok(res, serialize(conversion), 201);
   } catch (e) {
     if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
@@ -406,15 +436,15 @@ walletsRouter.post("/p2p", requireAuth, async (req, res) => {
         recipient: { id: recipient.id, name: recipient.name, phone: recipient.phone },
       };
     });
-    void deliverUserNotification(result.recipient.id, {
+    notifyUser(result.recipient.id, {
       title: "Money received",
       body: `${result.display}${result.note ? ` · ${result.note}` : ""}`,
       href: "/notifications",
-      email: {
-        prefKey: "emailTransfers",
-        subject: "Money received on MagnetPay",
-        text: `Hi ${result.recipient.name || "there"},\n\nYou received ${result.display}${result.note ? ` (${result.note})` : ""} via P2P.\n\n— MagnetPay`,
-      },
+      emailPref: "emailTransfers",
+      emailSubject: "Money received on MagnetPay",
+      emailText: mpEmail(result.recipient.name, [
+        `You received ${result.display}${result.note ? ` (${result.note})` : ""} via P2P.`,
+      ]),
     });
     return ok(res, serialize({ ...result, recipient: result.recipient }), 201);
   } catch (e) {

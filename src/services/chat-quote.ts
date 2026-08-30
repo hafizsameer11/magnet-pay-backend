@@ -1,7 +1,7 @@
 import type { Currency } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { formatMoney } from "./ledger.js";
-import { deliverUserNotification } from "./deliver.js";
+import { mpEmail, notifyUser } from "./user-notify.js";
 
 export async function getConversationContext(conversationId: string, userId: string) {
   const part = await prisma.conversationParticipant.findFirst({
@@ -184,10 +184,13 @@ export async function upsertChatQuote(input: {
     });
   });
 
-  void deliverUserNotification(buyerId, {
+  notifyUser(buyerId, {
     title: existing ? "Quote updated" : "New quote in chat",
     body: `${ctx.product?.title ?? rfq.title} · ${display}`,
     href: `/messages/${input.conversationId}`,
+    emailPref: "emailEscrow",
+    emailSubject: existing ? "Quote updated" : "New quote in chat",
+    emailText: mpEmail(null, [`${existing ? "Updated" : "New"} quote: ${ctx.product?.title ?? rfq.title} · ${display}`]),
   });
 
   return { quote, message: msg };

@@ -5,10 +5,9 @@ import {fail, ok, requireAuth, serialize, param } from "../lib/http.js";
 import { creditWallet, debitWallet, formatMoney, recordTx } from "../services/ledger.js";
 import { getNombaProvider } from "../services/nomba.js";
 import { assertRecipientVerified, verifyRecipientById } from "../services/recipient-verify.js";
-import { deliverUserNotification } from "../services/deliver.js";
+import { mpEmail, notifyUser } from "../services/user-notify.js";
 import { assertWithinDailyLimit } from "../services/limits.js";
 import { assertKycForAction, KycRequiredError } from "../services/kyc-access.js";
-import { notifyUserEmail } from "../services/notify.js";
 
 export const recipientsRouter = Router();
 export const transfersRouter = Router();
@@ -226,15 +225,15 @@ transfersRouter.post("/", requireAuth, async (req, res) => {
       where: { id: req.user!.id },
       select: { id: true, email: true, name: true, notificationPrefs: true, deviceTokens: true },
     });
-    void deliverUserNotification(req.user!.id, {
+    notifyUser(req.user!.id, {
       title: "Transfer succeeded",
       body: `${formatMoney(body.data.currency, amountMinor)} to ${recipient.name}`,
       href: `/tx/${transfer.id}`,
-      email: {
-        prefKey: "emailTransfers",
-        subject: "Transfer succeeded",
-        text: `Hi ${sender?.name || "there"},\n\nYour transfer of ${formatMoney(body.data.currency, amountMinor)} to ${recipient.name} succeeded.\n\n— MagnetPay`,
-      },
+      emailPref: "emailTransfers",
+      emailSubject: "Transfer succeeded",
+      emailText: mpEmail(sender?.name, [
+        `Your transfer of ${formatMoney(body.data.currency, amountMinor)} to ${recipient.name} succeeded.`,
+      ]),
     });
     return ok(res, serialize(transfer), 201);
   } catch (e) {
@@ -275,12 +274,16 @@ transfersRouter.post("/:id/retry", requireAuth, async (req, res) => {
       where: { id: req.user!.id },
       select: { email: true, name: true, notificationPrefs: true },
     });
-    notifyUserEmail(
-      sender,
-      "emailTransfers",
-      "Transfer succeeded",
-      `Hi ${sender?.name || "there"},\n\nYour transfer of ${formatMoney(row.currency, row.amountMinor)} to ${row.recipient?.name ?? "recipient"} succeeded (retry).\n\n— MagnetPay`,
-    );
+    notifyUser(req.user!.id, {
+      title: "Transfer succeeded",
+      body: `${formatMoney(row.currency, row.amountMinor)} to ${row.recipient?.name ?? "recipient"} (retry)`,
+      href: `/tx/${row.id}`,
+      emailPref: "emailTransfers",
+      emailSubject: "Transfer succeeded",
+      emailText: mpEmail(sender?.name, [
+        `Your transfer of ${formatMoney(row.currency, row.amountMinor)} to ${row.recipient?.name ?? "recipient"} succeeded (retry).`,
+      ]),
+    });
     return ok(res, serialize(updated));
   } catch (e) {
     return fail(res, 400, "RETRY_FAILED", e instanceof Error ? e.message : "Retry failed");
@@ -320,6 +323,20 @@ transfersRouter.post("/:id/refund", requireAuth, async (req, res) => {
         data: { status: "REFUNDED" },
         include: { recipient: true, events: { orderBy: { createdAt: "asc" } } },
       });
+    });
+    const sender = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { name: true },
+    });
+    notifyUser(req.user!.id, {
+      title: "Transfer refunded",
+      body: `+${formatMoney(row.currency, row.amountMinor)} returned to wallet`,
+      href: `/tx/${row.id}`,
+      emailPref: "emailTransfers",
+      emailSubject: "Transfer refunded",
+      emailText: mpEmail(sender?.name, [
+        `Your transfer of ${formatMoney(row.currency, row.amountMinor)} was refunded to your wallet.`,
+      ]),
     });
     return ok(res, serialize(updated));
   } catch (e) {

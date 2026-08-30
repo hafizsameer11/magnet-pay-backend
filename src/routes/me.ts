@@ -6,6 +6,7 @@ import {
   mergeNotificationPrefs,
   parseDeviceTokens,
 } from "../services/notify.js";
+import { mpEmail, notifyUser } from "../services/user-notify.js";
 
 export const meRouter = Router();
 
@@ -226,12 +227,13 @@ meRouter.post("/export", requireAuth, async (req, res) => {
 meRouter.delete("/", requireAuth, async (req, res) => {
   const body = z.object({ confirm: z.literal("DELETE") }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", 'Send { "confirm": "DELETE" }');
-  await prisma.notification.create({
-    data: {
-      userId: req.user!.id,
-      title: "Account deletion scheduled",
-      body: "Your request was received. Support will confirm within 7 days.",
-    },
+  notifyUser(req.user!.id, {
+    title: "Account deletion scheduled",
+    body: "Your request was received. Support will confirm within 7 days.",
+    href: "/settings",
+    emailPref: "emailKyc",
+    emailSubject: "Account deletion scheduled",
+    emailText: mpEmail(null, ["Your account deletion request was received. Support will confirm within 7 days."]),
   });
   return ok(res, { scheduled: true });
 });

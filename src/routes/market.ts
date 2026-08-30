@@ -19,6 +19,7 @@ import {
   orderDocumentsForSeller,
   REQUIRED_SELLER_DOC_KINDS,
 } from "../services/order-docs.js";
+import { mpEmail, notifyUser, notifyUsers } from "../services/user-notify.js";
 
 export const marketRouter = Router();
 
@@ -483,19 +484,21 @@ marketRouter.patch("/seller/orders/:id", requireAuth, async (req, res) => {
     body.data.status === "SHIPPED"
       ? "Seller marked order as shipped"
       : "Order update";
-  await prisma.notification.create({
-    data: {
-      userId: order.userId,
-      title,
-      body: [
-        body.data.status ? `Status: ${body.data.status}` : null,
-        body.data.carrier ? `Carrier: ${body.data.carrier}` : null,
-        body.data.tracking ? `Tracking: ${body.data.tracking}` : null,
-        body.data.note,
-      ]
-        .filter(Boolean)
-        .join(" · ") || title,
-    },
+  const notifBody = [
+    body.data.status ? `Status: ${body.data.status}` : null,
+    body.data.carrier ? `Carrier: ${body.data.carrier}` : null,
+    body.data.tracking ? `Tracking: ${body.data.tracking}` : null,
+    body.data.note,
+  ]
+    .filter(Boolean)
+    .join(" · ") || title;
+  notifyUser(order.userId, {
+    title,
+    body: notifBody,
+    href: `/market/order/${order.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: title,
+    emailText: mpEmail(null, [notifBody]),
   });
   if (body.data.status === "SHIPPED" && updated.shipmentId) {
     try {
@@ -591,8 +594,13 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, async (req, res) 
   const list = [...(all[order.id] ?? []), { ...body.data, uploadedAt: new Date().toISOString() }];
   all[order.id] = list;
   await saveSellerMeta(req.user!.id, { orderDocs: all });
-  await prisma.notification.create({
-    data: { userId: order.userId, title: "New shipping document", body: `${body.data.name} · order ${order.id.slice(0, 8)}` },
+  notifyUser(order.userId, {
+    title: "New shipping document",
+    body: `${body.data.name} · order ${order.id.slice(0, 8)}`,
+    href: `/market/order/${order.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "New shipping document",
+    emailText: mpEmail(null, [`${body.data.name} was uploaded for order ${order.id.slice(0, 8)}.`]),
   });
   return ok(res, list[list.length - 1], 201);
 });
@@ -619,12 +627,13 @@ marketRouter.post("/seller/orders/:id/documents/send", requireAuth, async (req, 
   await saveSellerMeta(req.user!.id, { orderDocPackageSent: sentMap });
 
   const docList = documents.map((d) => d.name).join(", ");
-  await prisma.notification.create({
-    data: {
-      userId: order.userId,
-      title: "Shipping doc package ready",
-      body: `${store.name} sent ${documents.length} documents for order ${order.id.slice(0, 8)}: ${docList}`,
-    },
+  notifyUser(order.userId, {
+    title: "Shipping doc package ready",
+    body: `${store.name} sent ${documents.length} documents for order ${order.id.slice(0, 8)}: ${docList}`,
+    href: `/market/order/${order.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Shipping doc package ready",
+    emailText: mpEmail(null, [`${store.name} sent ${documents.length} documents for order ${order.id.slice(0, 8)}: ${docList}`]),
   });
 
   return ok(
@@ -865,30 +874,30 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
         status: "COMPLETED",
         icon: "shield",
       });
-      await tx.notification.create({
-        data: {
-          userId: sellerUserId,
-          title: "New market order",
-          body: `${orderTitle} · ${formatMoney(currency, totalMinor)}`,
-        },
-      });
-      if (body.success && (body.data.addressLabel || body.data.addressLine)) {
-        await tx.notification.create({
-          data: {
-            userId: req.user!.id,
-            title: "Delivery preference saved",
-            body: [
-              body.data.deliveryMethod === "DOORSTEP" ? "Doorstep delivery" : "Warehouse pickup",
-              body.data.addressLabel,
-              body.data.addressLine,
-            ]
-              .filter(Boolean)
-              .join(" · "),
-          },
-        });
-      }
       return { ...o, escrowId: escrow.id };
     });
+    notifyUser(sellerUserId, {
+      title: "New market order",
+      body: `${orderTitle} · ${formatMoney(currency, totalMinor)}`,
+      href: `/market/order/${order.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "New market order",
+      emailText: mpEmail(null, [`You received a new order: ${orderTitle} · ${formatMoney(currency, totalMinor)}.`]),
+    });
+    if (body.success && (body.data.addressLabel || body.data.addressLine)) {
+      const prefBody = [
+        body.data.deliveryMethod === "DOORSTEP" ? "Doorstep delivery" : "Warehouse pickup",
+        body.data.addressLabel,
+        body.data.addressLine,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      notifyUser(req.user!.id, {
+        title: "Delivery preference saved",
+        body: prefBody,
+        href: `/market/order/${order.id}`,
+      });
+    }
     return ok(res, serialize(order), 201);
   } catch (e) {
     if (e instanceof KycRequiredError) return fail(res, 403, "KYC_REQUIRED", e.message);
@@ -1085,12 +1094,13 @@ marketRouter.post("/orders/:id/release", requireAuth, async (req, res) => {
       select: { userId: true },
     });
     if (store) {
-      await prisma.notification.create({
-        data: {
-          userId: store.userId,
-          title: "Funds released",
-          body: `Buyer released order ${order.id.slice(0, 8)}`,
-        },
+      notifyUser(store.userId, {
+        title: "Funds released",
+        body: `Buyer released order ${order.id.slice(0, 8)}`,
+        href: `/market/order/${order.id}`,
+        emailPref: "emailEscrow",
+        emailSubject: "Funds released",
+        emailText: mpEmail(null, [`Buyer released funds for order ${order.id.slice(0, 8)}.`]),
       });
       await maybeIssueFapiao(store.userId, order).catch(() => null);
     }
@@ -1116,12 +1126,13 @@ marketRouter.post("/orders/:id/dispute", requireAuth, async (req, res) => {
   });
   const store = await prisma.sellerStore.findUnique({ where: { id: order.supplier } });
   if (store) {
-    await prisma.notification.create({
-      data: {
-        userId: store.userId,
-        title: "Order disputed",
-        body: body.data.reason.slice(0, 120),
-      },
+    notifyUser(store.userId, {
+      title: "Order disputed",
+      body: body.data.reason.slice(0, 120),
+      href: `/market/order/${order.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Order disputed",
+      emailText: mpEmail(null, [`Order ${order.id.slice(0, 8)} was disputed: ${body.data.reason.slice(0, 200)}`]),
     });
   }
   return ok(res, serialize(updated));
@@ -1330,13 +1341,10 @@ marketRouter.post("/seller/team", requireAuth, async (req, res) => {
   if (body.data.phone) {
     const invitee = await prisma.user.findFirst({ where: { phone: body.data.phone } });
     if (invitee) {
-      await prisma.notification.create({
-        data: {
-          userId: invitee.id,
-          title: "Seller team invite",
-          body: `You were invited to ${store.name} as ${body.data.role}`,
-          href: `/seller/team/accept?token=${token}`,
-        },
+      notifyUser(invitee.id, {
+        title: "Seller team invite",
+        body: `You were invited to ${store.name} as ${body.data.role}`,
+        href: `/seller/team/accept?token=${token}`,
       });
     }
   }
@@ -1458,13 +1466,14 @@ marketRouter.post("/rfq", requireAuth, async (req, res) => {
     select: { id: true },
   });
   if (sellers.length) {
-    await prisma.notification.createMany({
-      data: sellers.map((s) => ({
-        userId: s.id,
+    notifyUsers(
+      sellers.map((s) => s.id),
+      {
         title: "New RFQ",
         body: rfq.title,
-      })),
-    });
+        href: `/market/rfq/${rfq.id}`,
+      },
+    );
   }
   return ok(res, serialize(rfq), 201);
 });
@@ -1538,12 +1547,10 @@ marketRouter.post("/rfq/:id/quotes", requireAuth, async (req, res) => {
     },
     include: { seller: { select: { id: true, name: true, avatarUrl: true } } },
   });
-  await prisma.notification.create({
-    data: {
-      userId: rfq.buyerId,
-      title: "New quote on your RFQ",
-      body: rfq.title,
-    },
+  notifyUser(rfq.buyerId, {
+    title: "New quote on your RFQ",
+    body: rfq.title,
+    href: `/market/rfq/${rfq.id}`,
   });
   return ok(res, serialize(quote), 201);
 });

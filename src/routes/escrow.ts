@@ -10,7 +10,7 @@ import {
   settleEscrowRelease,
 } from "../services/ledger.js";
 import { fulfillmentForEscrow, releaseGate } from "../services/escrow-fulfillment.js";
-import { notifyUserEmail } from "../services/notify.js";
+import { mpEmail, notifyUser } from "../services/user-notify.js";
 
 export const escrowRouter = Router();
 
@@ -168,6 +168,29 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       include: { milestones: true, invites: true },
     });
   });
+  if (sellerId) {
+    notifyUser(sellerId, {
+      title: "New escrow deal",
+      body: body.data.title,
+      href: `/escrow/${escrow!.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "New escrow deal",
+      emailText: mpEmail(null, [`You were added to escrow "${body.data.title}".`]),
+    });
+  } else if (body.data.invitePhone) {
+    const invitee = await prisma.user.findFirst({
+      where: { phone: body.data.invitePhone },
+      select: { id: true },
+    });
+    notifyUser(invitee?.id, {
+      title: "Escrow invite",
+      body: body.data.title,
+      href: `/escrow/invite/${inviteToken}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow invite",
+      emailText: mpEmail(null, [`You were invited to escrow "${body.data.title}".`]),
+    });
+  }
   return ok(res, serialize(escrow), 201);
 });
 
@@ -184,13 +207,14 @@ escrowRouter.post("/invite/:token/decline", requireAuth, async (req, res) => {
       where: { id: invite.escrowId },
       data: { status: "CANCELLED" },
     });
-    await tx.notification.create({
-      data: {
-        userId: invite.escrow.buyerId,
-        title: "Invite declined",
-        body: invite.escrow.title,
-      },
-    });
+  });
+  notifyUser(invite.escrow.buyerId, {
+    title: "Invite declined",
+    body: invite.escrow.title,
+    href: `/escrow/${invite.escrowId}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Escrow invite declined",
+    emailText: mpEmail(null, [`Your escrow invite for "${invite.escrow.title}" was declined.`]),
   });
   return ok(res, { ok: true });
 });
@@ -213,6 +237,14 @@ escrowRouter.post("/invite/:token/accept", requireAuth, async (req, res) => {
       data: { sellerId: req.user!.id, status: "AWAITING_FUNDS" },
       include: { milestones: true },
     });
+  });
+  notifyUser(invite.escrow.buyerId, {
+    title: "Escrow invite accepted",
+    body: invite.escrow.title,
+    href: `/escrow/${invite.escrowId}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Escrow invite accepted",
+    emailText: mpEmail(null, [`Your escrow invite for "${invite.escrow.title}" was accepted.`]),
   });
   return ok(res, serialize(updated));
 });
@@ -260,21 +292,18 @@ escrowRouter.post("/:id/fund", requireAuth, async (req, res) => {
         include: { milestones: true },
       });
     });
-    const parties = await prisma.user.findMany({
-      where: {
-        id: {
-          in: [escrow.buyerId, ...(escrow.sellerId ? [escrow.sellerId] : [])].filter(Boolean),
-        },
-      },
-      select: { id: true, email: true, name: true, notificationPrefs: true },
-    });
-    for (const u of parties) {
-      notifyUserEmail(
-        u,
-        "emailEscrow",
-        "Escrow funded",
-        `Hi ${u.name || "there"},\n\nEscrow "${escrow.title}" is now active and funded (${formatMoney(escrow.currency, escrow.amountMinor)}).\n\n— MagnetPay`,
-      );
+    const partyIds = [escrow.buyerId, ...(escrow.sellerId ? [escrow.sellerId] : [])].filter(Boolean);
+    for (const userId of partyIds) {
+      notifyUser(userId, {
+        title: "Escrow funded",
+        body: `"${escrow.title}" is now active and funded (${formatMoney(escrow.currency, escrow.amountMinor)}).`,
+        href: `/escrow/${escrow.id}`,
+        emailPref: "emailEscrow",
+        emailSubject: "Escrow funded",
+        emailText: mpEmail(null, [
+          `Escrow "${escrow.title}" is now active and funded (${formatMoney(escrow.currency, escrow.amountMinor)}).`,
+        ]),
+      });
     }
     return ok(res, serialize(updated));
   } catch (e) {
@@ -340,20 +369,25 @@ escrowRouter.post("/:id/milestones/:msId/release", requireAuth, async (req, res)
         where: { escrowId: escrow.id, status: { in: ["IN_ESCROW", "SHIPPED", "DELIVERED"] } },
         data: { status: "COMPLETED" },
       });
-      const parties = await prisma.user.findMany({
-        where: {
-          id: { in: [escrow.buyerId, escrow.sellerId!].filter(Boolean) },
-        },
-        select: { email: true, name: true, notificationPrefs: true },
+    }
+    const partyIds = [escrow.buyerId, escrow.sellerId!].filter(Boolean);
+    const releaseTitle = updated?.status === "COMPLETED" ? "Escrow completed" : "Milestone released";
+    for (const userId of partyIds) {
+      notifyUser(userId, {
+        title: releaseTitle,
+        body:
+          updated?.status === "COMPLETED"
+            ? `"${escrow.title}" is complete. Milestone "${ms.label}" was released.`
+            : `"${ms.label}" released · ${formatMoney(escrow.currency, ms.amountMinor)}`,
+        href: `/escrow/${escrow.id}`,
+        emailPref: "emailEscrow",
+        emailSubject: releaseTitle,
+        emailText: mpEmail(null, [
+          updated?.status === "COMPLETED"
+            ? `Escrow "${escrow.title}" is complete. Milestone "${ms.label}" was released.`
+            : `Milestone "${ms.label}" was released on escrow "${escrow.title}".`,
+        ]),
       });
-      for (const u of parties) {
-        notifyUserEmail(
-          u,
-          "emailEscrow",
-          "Escrow completed",
-          `Hi ${u.name || "there"},\n\nEscrow "${escrow.title}" is complete. Milestone "${ms.label}" was released.\n\n— MagnetPay`,
-        );
-      }
     }
     return ok(res, serialize(updated));
   } catch (e) {
@@ -382,6 +416,17 @@ escrowRouter.post("/:id/dispute", requireAuth, async (req, res) => {
       },
     });
   });
+  const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
+  if (peerId) {
+    notifyUser(peerId, {
+      title: "Escrow disputed",
+      body: body.data.reason.slice(0, 120),
+      href: `/escrow/${escrow.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow disputed",
+      emailText: mpEmail(null, [`Escrow "${escrow.title}" was disputed: ${body.data.reason.slice(0, 200)}`]),
+    });
+  }
   return ok(res, serialize(dispute), 201);
 });
 
@@ -401,17 +446,16 @@ escrowRouter.post("/:id/documents", requireAuth, async (req, res) => {
   const doc = await prisma.escrowDocument.create({
     data: { escrowId: escrow.id, name: body.data.name, url: body.data.url },
   });
-  if (body.data.note) {
-    const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
-    if (peerId) {
-      await prisma.notification.create({
-        data: {
-          userId: peerId,
-          title: "New escrow document",
-          body: `${body.data.name} · ${escrow.title}`,
-        },
-      });
-    }
+  const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
+  if (peerId) {
+    notifyUser(peerId, {
+      title: "New escrow document",
+      body: `${body.data.name} · ${escrow.title}`,
+      href: `/escrow/${escrow.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "New escrow document",
+      emailText: mpEmail(null, [`${body.data.name} was added to escrow "${escrow.title}".`]),
+    });
   }
   return ok(res, serialize(doc), 201);
 });
@@ -433,12 +477,13 @@ escrowRouter.post("/:id/milestones/:msId/request-release", requireAuth, async (r
     where: { id: ms.id },
     data: { releaseRequestedAt: new Date() },
   });
-  await prisma.notification.create({
-    data: {
-      userId: escrow.buyerId,
-      title: "Seller requested release",
-      body: `${ms.label} · ${escrow.title} · confirm shipped/delivered then release`,
-    },
+  notifyUser(escrow.buyerId, {
+    title: "Seller requested release",
+    body: `${ms.label} · ${escrow.title} · confirm shipped/delivered then release`,
+    href: `/escrow/${escrow.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Seller requested release",
+    emailText: mpEmail(null, [`Seller requested release for "${ms.label}" on escrow "${escrow.title}".`]),
   });
   return ok(res, serialize({ ok: true, milestoneId: msId, releaseRequestedAt: new Date().toISOString() }));
 });
@@ -477,17 +522,18 @@ escrowRouter.post("/:id/counter", requireAuth, async (req, res) => {
         });
       }
     }
-    await tx.notification.create({
-      data: {
-        userId: escrow.buyerId,
-        title: "Counter offer received",
-        body: body.data.note || escrow.title,
-      },
-    });
     return tx.escrow.findUnique({
       where: { id: e.id },
       include: { milestones: { orderBy: { sortOrder: "asc" } } },
     });
+  });
+  notifyUser(escrow.buyerId, {
+    title: "Counter offer received",
+    body: body.data.note || escrow.title,
+    href: `/escrow/${escrow.id}`,
+    emailPref: "emailEscrow",
+    emailSubject: "Counter offer received",
+    emailText: mpEmail(null, [`You received a counter offer on escrow "${escrow.title}".`]),
   });
   return ok(res, serialize(updated));
 });
@@ -519,12 +565,13 @@ escrowRouter.post("/:id/dispute/messages", requireAuth, async (req, res) => {
   });
   const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
   if (peerId) {
-    await prisma.notification.create({
-      data: {
-        userId: peerId,
-        title: "Dispute update",
-        body: body.data.message.slice(0, 120),
-      },
+    notifyUser(peerId, {
+      title: "Dispute update",
+      body: body.data.message.slice(0, 120),
+      href: `/escrow/${escrow.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Dispute update",
+      emailText: mpEmail(null, [`New message on escrow dispute "${escrow.title}".`]),
     });
   }
   return ok(res, serialize(updated));
@@ -541,13 +588,18 @@ escrowRouter.post("/:id/cancel", requireAuth, async (req, res) => {
   }
   const updated = await prisma.$transaction(async (tx) => {
     const row = await tx.escrow.update({ where: { id }, data: { status: "CANCELLED" } });
-    const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
-    if (peerId) {
-      await tx.notification.create({
-        data: { userId: peerId, title: "Escrow cancelled", body: escrow.title },
-      });
-    }
     return row;
   });
+  const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
+  if (peerId) {
+    notifyUser(peerId, {
+      title: "Escrow cancelled",
+      body: escrow.title,
+      href: `/escrow/${escrow.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow cancelled",
+      emailText: mpEmail(null, [`Escrow "${escrow.title}" was cancelled.`]),
+    });
+  }
   return ok(res, serialize(updated));
 });

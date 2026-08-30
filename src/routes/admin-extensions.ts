@@ -22,6 +22,7 @@ import {
   getAdminRecord,
   patchAdminRecord,
 } from "../services/admin-records.js";
+import { notifyConversationPeers, notifyUser, notifyUsers, mpEmail } from "../services/user-notify.js";
 
 const userSelect = { id: true, name: true, phone: true, email: true, role: true };
 
@@ -86,6 +87,11 @@ export function registerAdminExtensions(router: Router) {
       data: { orderId: order.id, authorId: req.user!.id, body: body.data.body },
       include: { author: { select: userSelect } },
     });
+    notifyUser(order.userId, {
+      title: "Order note from MagnetPay",
+      body: body.data.body.slice(0, 120),
+      href: `/market/order/${order.id}`,
+    });
     return ok(res, serialize(row), 201);
   });
 
@@ -107,6 +113,23 @@ export function registerAdminExtensions(router: Router) {
         entityId: order.id,
         meta: { reason: body.data.reason, amountMinor: body.data.amountMinor ?? order.totalMinor.toString() },
       },
+    });
+    notifyUser(order.userId, {
+      title: "Order refunded",
+      body: body.data.reason ?? `Order ${order.id.slice(0, 8)} was cancelled and refunded.`,
+      href: `/market/order/${order.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Order refunded",
+      emailText: mpEmail(null, [`Your order ${order.id.slice(0, 8)} was refunded.${body.data.reason ? ` Reason: ${body.data.reason}` : ""}`]),
+    });
+    const store = await prisma.sellerStore.findFirst({
+      where: { OR: [{ id: order.supplier }, { name: order.supplier }] },
+      select: { userId: true },
+    });
+    notifyUser(store?.userId, {
+      title: "Order refunded",
+      body: `Order ${order.id.slice(0, 8)} was refunded by MagnetPay ops.`,
+      href: `/market/order/${order.id}`,
     });
     return ok(res, serialize(updated));
   });
@@ -221,6 +244,17 @@ export function registerAdminExtensions(router: Router) {
         assignee: { select: userSelect },
       },
     });
+    const partyIds = [row.escrow?.buyerId, row.escrow?.sellerId].filter(Boolean) as string[];
+    if (body.data.status || body.data.outcome || body.data.ruling) {
+      notifyUsers(partyIds, {
+        title: "Dispute update",
+        body: body.data.outcome ?? body.data.ruling ?? body.data.status ?? "Your dispute was updated.",
+        href: row.escrow ? `/escrow/${row.escrow.id}` : "/notifications",
+        emailPref: "emailEscrow",
+        emailSubject: "Dispute update",
+        emailText: mpEmail(null, ["Your MagnetPay dispute was updated by support."]),
+      });
+    }
     return ok(res, serialize(row));
   });
 
@@ -280,6 +314,11 @@ export function registerAdminExtensions(router: Router) {
           where: { id: conversationId },
           data: { updatedAt: new Date() },
         });
+        void notifyConversationPeers(conversationId, req.user!.id, {
+          title: "Support reply",
+          body: body.data.body.slice(0, 120),
+          href: `/messages/${conversationId}`,
+        });
       }
     }
     const updated = await patchAdminRecord(row.id, { payload: { ...payload, messages } });
@@ -319,6 +358,11 @@ export function registerAdminExtensions(router: Router) {
     await prisma.conversation.update({
       where: { id: conversationId },
       data: { updatedAt: new Date() },
+    });
+    void notifyConversationPeers(conversationId, req.user!.id, {
+      title: "New message",
+      body: body.data.body.slice(0, 120),
+      href: `/messages/${conversationId}`,
     });
     return ok(res, serialize(msg), 201);
   });
