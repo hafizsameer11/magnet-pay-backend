@@ -751,11 +751,29 @@ adminRouter.get("/export/transfers.csv", async (_req, res) => {
 
 adminRouter.get("/escrows", async (_req, res) => {
   const rows = await prisma.escrow.findMany({
-    include: { milestones: true, disputes: true },
+    include: {
+      milestones: true,
+      disputes: true,
+      buyer: { select: { id: true, name: true, phone: true } },
+      seller: { select: { id: true, name: true, phone: true } },
+    },
     orderBy: { createdAt: "desc" },
     take: 100,
   });
-  return ok(res, serialize(rows));
+  const orderLinks = await prisma.marketOrder.findMany({
+    where: { escrowId: { in: rows.map((r) => r.id) } },
+    select: { id: true, escrowId: true },
+  });
+  const orderByEscrow = new Map(orderLinks.map((o) => [o.escrowId!, o.id]));
+  return ok(
+    res,
+    serialize(
+      rows.map((r) => ({
+        ...r,
+        orderId: orderByEscrow.get(r.id) ?? null,
+      })),
+    ),
+  );
 });
 
 adminRouter.post("/escrows/:id/resolve", async (req, res) => {
