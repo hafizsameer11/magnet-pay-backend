@@ -1482,11 +1482,7 @@ marketRouter.post("/seller/fapiao", requireAuth, requireSellerKyb, async (req, r
   const bp = await prisma.businessProfile.findUnique({ where: { userId: req.user!.id } });
   let order: { id: string; userId: string; totalMinor: bigint; currency: string } | null = null;
   if (body.data.orderId) {
-    const store = await sellerStoreFor(req.user!.id);
-    if (!store) return fail(res, 404, "NO_STORE", "No seller store");
-    const o = await prisma.marketOrder.findFirst({
-      where: { id: body.data.orderId, OR: [{ supplier: store.id }, { supplier: store.name }] },
-    });
+    const { order: o } = await findSellerOrder(req.user!.id, body.data.orderId);
     if (!o) return fail(res, 404, "NOT_FOUND", "Order not found");
     order = o;
   }
