@@ -51,6 +51,10 @@ import {
   createAdminRecord,
   patchAdminRecord,
   upsertSupportTicketRecord,
+  listTicketsForUser,
+  getSupportTicketByConversationId,
+  isSupportSubject,
+  supportTopicFromSubject,
 } from "../services/admin-records.js";
 import { seedAdminRecords } from "../services/admin-records-seed.js";
 import { registerAdminExtensions } from "./admin-extensions.js";
@@ -399,6 +403,13 @@ messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res)
     where: { conversationId: param(req, "id"), userId: req.user!.id },
   });
   if (!part) return fail(res, 403, "FORBIDDEN", "Not a participant");
+  const conv = await prisma.conversation.findUnique({ where: { id: param(req, "id") } });
+  if (conv && isSupportSubject(conv.subject)) {
+    const ticket = await getSupportTicketByConversationId(conv.id);
+    if (ticket?.status === "closed") {
+      return fail(res, 403, "CLOSED", "This support chat has been closed");
+    }
+  }
   const msg = await prisma.message.create({
     data: {
       conversationId: param(req, "id"),
@@ -419,12 +430,54 @@ messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res)
   return ok(res, serialize(msg), 201);
 });
 
+messagesRouter.get("/support", requireAuth, async (req, res) => {
+  const me = req.user!;
+  const parts = await prisma.conversationParticipant.findMany({
+    where: {
+      userId: me.id,
+      hiddenAt: null,
+      conversation: { subject: { startsWith: "Support ·" } },
+    },
+    include: {
+      conversation: {
+        include: {
+          messages: { orderBy: { createdAt: "desc" }, take: 1 },
+        },
+      },
+    },
+    orderBy: { conversation: { updatedAt: "desc" } },
+  });
+  const tickets = await listTicketsForUser(me.id);
+  const statusByConv = new Map(
+    tickets.map((t) => {
+      const p = (t.payload ?? {}) as Record<string, unknown>;
+      return [String(p.conversationId ?? ""), t.status ?? "open"];
+    }),
+  );
+  const rows = parts.map((p) => {
+    const conv = p.conversation;
+    const latest = conv.messages[0];
+    const status = statusByConv.get(conv.id) ?? "open";
+    return {
+      id: conv.id,
+      topic: supportTopicFromSubject(conv.subject),
+      status,
+      closed: status === "closed",
+      updatedAt: conv.updatedAt.toISOString(),
+      lastMessage: latest?.body ?? null,
+      lastMessageAt: latest?.createdAt?.toISOString() ?? null,
+    };
+  });
+  return ok(res, serialize(rows));
+});
+
 messagesRouter.post("/support", requireAuth, async (req, res) => {
   const body = z
     .object({
       topic: z.string().min(2),
       message: z.string().optional().default(""),
       attachmentUrl: z.string().min(1).optional().nullable(),
+      conversationId: z.string().uuid().optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "topic and message required");
@@ -442,45 +495,52 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
     select: { id: true },
   });
   if (!admin) return fail(res, 503, "NO_ADMIN", "Support unavailable");
-  const existing = await prisma.conversationParticipant.findFirst({
-    where: {
-      userId: req.user!.id,
-      conversation: { subject: { contains: "Support" } },
-    },
-    include: { conversation: true },
-  });
   const user = await prisma.user.findUnique({
     where: { id: req.user!.id },
     select: { id: true, name: true },
   });
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
 
-  if (existing) {
-    const msgBody = text ? `[${body.data.topic}] ${text}` : `[${body.data.topic}] Attachment`;
+  if (body.data.conversationId) {
+    const convId = body.data.conversationId;
+    const part = await prisma.conversationParticipant.findFirst({
+      where: { conversationId: convId, userId: req.user!.id },
+      include: { conversation: true },
+    });
+    if (!part || !isSupportSubject(part.conversation.subject)) {
+      return fail(res, 404, "NOT_FOUND", "Support chat not found");
+    }
+    const ticket = await getSupportTicketByConversationId(convId);
+    if (ticket?.status === "closed") {
+      return fail(res, 403, "CLOSED", "This support chat has been closed");
+    }
     const msg = await prisma.message.create({
       data: {
-        conversationId: existing.conversationId,
+        conversationId: convId,
         senderId: req.user!.id,
-        body: msgBody,
+        body: text || "Attachment",
         attachmentUrl,
       },
+    });
+    await prisma.conversation.update({
+      where: { id: convId },
+      data: { updatedAt: new Date() },
     });
     await upsertSupportTicketRecord({
       userId: user.id,
       userName: user.name,
-      topic: body.data.topic,
-      conversationId: existing.conversationId,
+      topic: supportTopicFromSubject(part.conversation.subject),
+      conversationId: convId,
       channel: "in_app",
     }).catch(() => {});
-    if (admin) {
-      notifyUser(admin.id, {
-        title: "Support message",
-        body: `[${body.data.topic}] ${(text || "Attachment").slice(0, 120)}`,
-        href: `/messages/${existing.conversationId}`,
-      });
-    }
-    return ok(res, serialize({ conversationId: existing.conversationId, message: msg }));
+    notifyUser(admin.id, {
+      title: "Support message",
+      body: `[${supportTopicFromSubject(part.conversation.subject)}] ${(text || "Attachment").slice(0, 120)}`,
+      href: `/messages/${convId}`,
+    });
+    return ok(res, serialize({ conversationId: convId, message: msg }));
   }
+
   const conv = await prisma.$transaction(async (tx) => {
     const c = await tx.conversation.create({
       data: {

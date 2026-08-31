@@ -21,6 +21,8 @@ import {
   listAdminRecords,
   getAdminRecord,
   patchAdminRecord,
+  closeSupportTicketByConversationId,
+  isSupportSubject,
 } from "../services/admin-records.js";
 import {
   adjustUserWallet,
@@ -437,6 +439,29 @@ export function registerAdminExtensions(router: Router) {
       href: `/messages/${conversationId}`,
     });
     return ok(res, serialize(msg), 201);
+  });
+
+  router.post("/conversations/:id/close", async (req, res) => {
+    const conversationId = param(req, "id");
+    const conv = await prisma.conversation.findUnique({ where: { id: conversationId } });
+    if (!conv || !isSupportSubject(conv.subject)) {
+      return fail(res, 400, "INVALID", "Not a support conversation");
+    }
+    const ticket = await closeSupportTicketByConversationId(conversationId);
+    if (!ticket) return fail(res, 404, "NOT_FOUND", "Support ticket not found");
+    await prisma.message.create({
+      data: {
+        conversationId,
+        senderId: req.user!.id,
+        body: "[Support] This conversation has been closed. Open a new chat if you need more help.",
+      },
+    });
+    void notifyConversationPeers(conversationId, req.user!.id, {
+      title: "Support chat closed",
+      body: "This support conversation has been closed.",
+      href: `/messages/${conversationId}`,
+    });
+    return ok(res, serialize({ closed: true, ticket }));
   });
 
   const domainGet = (path: string, domain: string) => {

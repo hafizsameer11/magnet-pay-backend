@@ -1,5 +1,10 @@
 import type { Currency } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
+import {
+  getSupportTicketByConversationId,
+  isSupportSubject,
+  supportTopicFromSubject,
+} from "./admin-records.js";
 import { formatMoney } from "./ledger.js";
 import { mpEmail, notifyUser } from "./user-notify.js";
 
@@ -42,12 +47,26 @@ export async function getConversationContext(conversationId: string, userId: str
     me?.role === "BOTH" ||
     (product?.store?.userId != null && product.store.userId === userId);
 
+  const isSupport = isSupportSubject(conv.subject);
+  let supportMeta: { topic: string; status: string; closed: boolean } | null = null;
+  if (isSupport) {
+    const ticket = await getSupportTicketByConversationId(conv.id);
+    const status = ticket?.status ?? "open";
+    supportMeta = {
+      topic: supportTopicFromSubject(conv.subject),
+      status,
+      closed: status === "closed",
+    };
+  }
+
   return {
     conversation: conv,
     peer,
     product,
     latestQuote,
     amSeller,
+    isSupport,
+    supportMeta,
   };
 }
 

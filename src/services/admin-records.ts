@@ -111,3 +111,31 @@ export async function listTicketsForUser(userId: string, status?: string) {
     return p.userId === userId;
   });
 }
+
+export function isSupportSubject(subject: string | null | undefined) {
+  return Boolean(subject?.startsWith("Support ·"));
+}
+
+export function supportTopicFromSubject(subject: string | null | undefined) {
+  return subject?.replace(/^Support ·\s*/, "") ?? "Support";
+}
+
+export async function getSupportTicketByConversationId(conversationId: string) {
+  const rows = await prisma.adminRecord.findMany({
+    where: { domain: "ticket" },
+    orderBy: { updatedAt: "desc" },
+    take: 500,
+  });
+  return (
+    rows.find((r) => {
+      const p = (r.payload ?? {}) as Record<string, unknown>;
+      return p.conversationId === conversationId;
+    }) ?? null
+  );
+}
+
+export async function closeSupportTicketByConversationId(conversationId: string) {
+  const ticket = await getSupportTicketByConversationId(conversationId);
+  if (!ticket) return null;
+  return patchAdminRecord(ticket.id, { status: "closed" });
+}
