@@ -22,6 +22,7 @@ import {
 } from "../services/order-docs.js";
 import { mpEmail, notifyUser, notifyUsers } from "../services/user-notify.js";
 import { unitMinorForProduct } from "../services/product-pricing.js";
+import { parseProductSearchQuery, searchProducts } from "../services/product-search.js";
 
 export const marketRouter = Router();
 
