@@ -267,7 +267,7 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
           slot: z.string().min(2),
           contact: z.string().min(2),
           phone: z.string().min(6),
-          addr: z.string().min(4),
+          addr: z.string().optional(),
           notes: z.string().optional(),
         })
         .optional(),
@@ -323,11 +323,14 @@ logisticsRouter.post("/quotes/:quoteId/book", requireAuth, async (req, res) => {
       });
       if (docBody.success && docBody.data.pickup) {
         const p = docBody.data.pickup;
+        const pickupAddr =
+          p.addr?.trim() ||
+          (quote.request.orderId ? `${quote.request.origin} · MagnetPay vendor pickup` : "Pickup TBD");
         await tx.shipmentEvent.create({
           data: {
             shipmentId: s.id,
             status: "HOLD_LOCKED",
-            message: `Pickup ${p.date} · ${p.slot} · ${p.contact} · ${p.addr}`,
+            message: `Pickup ${p.date} · ${p.slot} · ${p.contact} · ${pickupAddr}`,
           },
         });
       }

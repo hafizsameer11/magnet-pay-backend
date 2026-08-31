@@ -39,7 +39,7 @@ export async function generatePartnerQuotes(input: {
   const validUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   const partners = await prisma.logisticsPartner.findMany({
-    where: { active: true, kind: "FREIGHT_FORWARDER" },
+    where: { active: true, kind: "FREIGHT_FORWARDER", code: "MAGNET" },
     include: {
       rates: {
         where: { active: true, mode: input.mode },

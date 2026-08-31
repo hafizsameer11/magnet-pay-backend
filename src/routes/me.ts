@@ -4,10 +4,12 @@ import { prisma } from "../lib/prisma.js";
 import {fail, ok, requireAuth, serialize, param, inputJson } from "../lib/http.js";
 import {
   mergeNotificationPrefs,
-  parseDeviceTokens,
+  parseDeviceSessions,
+  serializeDeviceSessionsForClient,
+  type DeviceSession,
 } from "../services/notify.js";
 import { mpEmail, notifyUser } from "../services/user-notify.js";
-import { scheduleKycVerification } from "../services/kyc-verify-job.js";
+import { processKycVerification } from "../services/kyc-verify-job.js";
 
 export const meRouter = Router();
 
@@ -30,14 +32,28 @@ meRouter.patch("/", requireAuth, async (req, res) => {
       email: z.string().email().optional().nullable(),
       role: z.enum(["BUYER", "SELLER", "BOTH"]).optional(),
       avatarUrl: z.string().url().optional().nullable(),
+      dateOfBirth: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .nullable(),
       locale: z.string().optional(),
       onboardingDone: z.boolean().optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
+  if (body.data.role === "BOTH") {
+    return fail(res, 400, "VALIDATION", "Mixed buyer/seller accounts are not supported");
+  }
+  const { dateOfBirth, ...rest } = body.data;
   const user = await prisma.user.update({
     where: { id: req.user!.id },
-    data: body.data,
+    data: {
+      ...rest,
+      ...(dateOfBirth !== undefined
+        ? { dateOfBirth: dateOfBirth ? new Date(`${dateOfBirth}T00:00:00.000Z`) : null }
+        : {}),
+    },
   });
   return ok(res, serialize(user));
 });
@@ -56,6 +72,19 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
   const number = String(incoming.number ?? "").replace(/\D/g, "");
   if ((body.data.type === "BVN" || body.data.type === "NIN") && number.length !== 11) {
     return fail(res, 400, "VALIDATION", `${body.data.type} must be 11 digits`);
+  }
+
+  if (body.data.type === "BVN" || body.data.type === "NIN") {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.id },
+      select: { name: true, dateOfBirth: true },
+    });
+    if (!user?.name?.trim()) {
+      return fail(res, 400, "VALIDATION", "Add your full name on your profile before verifying identity");
+    }
+    if (!user.dateOfBirth) {
+      return fail(res, 400, "VALIDATION", "Add your date of birth on your profile before verifying identity");
+    }
   }
 
   const open = await prisma.kycApplication.findFirst({
@@ -94,7 +123,13 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
       });
 
   if (body.data.type === "BVN" || body.data.type === "NIN") {
-    scheduleKycVerification(app.id);
+    await processKycVerification(app.id);
+    const fresh = await prisma.kycApplication.findUnique({ where: { id: app.id } });
+    if (fresh?.status === "REJECTED") {
+      const payload = (fresh.payload ?? {}) as Record<string, unknown>;
+      return fail(res, 422, "KYC_REJECTED", String(payload.rejectionReason ?? "Identity verification failed"));
+    }
+    return ok(res, serialize(fresh ?? app), open ? 200 : 201);
   }
 
   return ok(res, serialize(app), open ? 200 : 201);
@@ -308,9 +343,27 @@ meRouter.patch("/notification-prefs", requireAuth, async (req, res) => {
   return ok(res, merged);
 });
 
+meRouter.get("/devices", requireAuth, async (req, res) => {
+  const deviceId = typeof req.query.deviceId === "string" ? req.query.deviceId.trim() : undefined;
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { deviceTokens: true },
+  });
+  if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+  const sessions = parseDeviceSessions(user.deviceTokens);
+  return ok(res, serialize(serializeDeviceSessionsForClient(sessions, deviceId)));
+});
+
 meRouter.post("/devices", requireAuth, async (req, res) => {
-  const body = z.object({ token: z.string().min(8) }).safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "token required");
+  const body = z
+    .object({
+      token: z.string().min(8),
+      deviceId: z.string().min(4).max(120),
+      label: z.string().min(1).max(120),
+      platform: z.string().min(1).max(32),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "token, deviceId, label, and platform required");
 
   const user = await prisma.user.findUnique({
     where: { id: req.user!.id },
@@ -318,12 +371,48 @@ meRouter.post("/devices", requireAuth, async (req, res) => {
   });
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
 
-  const tokens = parseDeviceTokens(user.deviceTokens);
-  if (!tokens.includes(body.data.token)) tokens.push(body.data.token);
+  const sessions = parseDeviceSessions(user.deviceTokens);
+  const now = new Date().toISOString();
+  const nextSession: DeviceSession = {
+    id: body.data.deviceId,
+    token: body.data.token,
+    label: body.data.label,
+    platform: body.data.platform,
+    lastSeenAt: now,
+  };
+
+  const idx = sessions.findIndex((s) => s.id === body.data.deviceId);
+  if (idx >= 0) sessions[idx] = nextSession;
+  else sessions.push(nextSession);
 
   await prisma.user.update({
     where: { id: req.user!.id },
-    data: { deviceTokens: tokens as object },
+    data: { deviceTokens: sessions as object },
   });
-  return ok(res, { tokens, registered: true }, 201);
+
+  return ok(
+    res,
+    {
+      registered: true,
+      sessions: serializeDeviceSessionsForClient(sessions, body.data.deviceId),
+    },
+    201,
+  );
+});
+
+meRouter.delete("/devices/:deviceId", requireAuth, async (req, res) => {
+  const deviceId = param(req, "deviceId");
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { deviceTokens: true },
+  });
+  if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
+
+  const sessions = parseDeviceSessions(user.deviceTokens).filter((s) => s.id !== deviceId);
+  await prisma.user.update({
+    where: { id: req.user!.id },
+    data: { deviceTokens: sessions as object },
+  });
+
+  return ok(res, { removed: deviceId, sessions: serializeDeviceSessionsForClient(sessions) });
 });

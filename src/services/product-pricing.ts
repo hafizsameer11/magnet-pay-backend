@@ -11,9 +11,13 @@ function tierToQty(to?: string) {
   return Number.isFinite(n) && n > 0 ? n : Number.POSITIVE_INFINITY;
 }
 
-function parseMoq(moq?: string | null) {
+export function parseProductMoq(moq?: string | null) {
   const n = Number(String(moq || "1").replace(/\D/g, ""));
   return n > 0 ? n : 1;
+}
+
+function parseMoq(moq?: string | null) {
+  return parseProductMoq(moq);
 }
 
 function normalizePricingTiers(raw: unknown): PricingTierRow[] {

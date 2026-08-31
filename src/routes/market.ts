@@ -22,8 +22,10 @@ import {
   REQUIRED_SELLER_DOC_KINDS,
 } from "../services/order-docs.js";
 import { mpEmail, notifyUser, notifyUsers } from "../services/user-notify.js";
-import { unitMinorForProduct } from "../services/product-pricing.js";
+import { unitMinorForProduct, parseProductMoq } from "../services/product-pricing.js";
 import { parseProductSearchQuery, searchProducts } from "../services/product-search.js";
+import { createOrderFreightQuote } from "../services/order-freight-quote.js";
+import { serializeQuoteForCompare } from "../services/partner-quotes.js";
 
 export const marketRouter = Router();
 
@@ -111,7 +113,7 @@ function orderLogisticsNextAction(order: {
     return "CONFIRM_POD";
   }
   if (order.shipment) return "TRACK_SHIPMENT";
-  if (order.logisticsStatus === "QUOTE_PENDING") return "COMPLETE_BOOKING";
+  if (order.logisticsStatus === "QUOTE_PENDING") return "COMPLETE_SHIPMENT";
   return "BOOK_FREIGHT";
 }
 
@@ -753,6 +755,11 @@ marketRouter.post("/cart/items", requireAuth, async (req, res) => {
     return fail(res, 400, "OUT_OF_STOCK", "Not enough stock");
   }
 
+  const moq = parseProductMoq(product.moq);
+  if (body.data.qty < moq) {
+    return fail(res, 400, "BELOW_MOQ", `Minimum order quantity is ${moq}`);
+  }
+
   let cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
   if (!cart) cart = await prisma.cart.create({ data: { userId: req.user!.id } });
   const item = await prisma.cartItem.upsert({
@@ -769,6 +776,10 @@ marketRouter.post("/cart/items", requireAuth, async (req, res) => {
     update: { qty: { increment: body.data.qty } },
     include: { product: true, variant: true },
   });
+  if (item.qty < moq) {
+    await prisma.cartItem.update({ where: { id: item.id }, data: { qty: moq } });
+    item.qty = moq;
+  }
   return ok(res, serialize(item), 201);
 });
 
@@ -777,8 +788,15 @@ marketRouter.patch("/cart/items/:id", requireAuth, async (req, res) => {
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid qty");
   const cart = await prisma.cart.findUnique({ where: { userId: req.user!.id } });
   if (!cart) return fail(res, 404, "NOT_FOUND", "Cart not found");
-  const existing = await prisma.cartItem.findFirst({ where: { id: param(req, "id"), cartId: cart.id } });
+  const existing = await prisma.cartItem.findFirst({
+    where: { id: param(req, "id"), cartId: cart.id },
+    include: { product: true },
+  });
   if (!existing) return fail(res, 404, "NOT_FOUND", "Item not found");
+  const moq = parseProductMoq(existing.product.moq);
+  if (body.data.qty < moq) {
+    return fail(res, 400, "BELOW_MOQ", `Minimum order quantity is ${moq}`);
+  }
   const item = await prisma.cartItem.update({
     where: { id: existing.id },
     data: { qty: body.data.qty },
@@ -809,6 +827,13 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
     include: { items: { include: { product: { include: { store: true } }, variant: true } } },
   });
   if (!cart?.items.length) return fail(res, 400, "EMPTY_CART", "Cart is empty");
+
+  for (const item of cart.items) {
+    const moq = parseProductMoq(item.product.moq);
+    if (item.qty < moq) {
+      return fail(res, 400, "BELOW_MOQ", `${item.product.title} requires at least ${moq} units`);
+    }
+  }
 
   const storeIds = [...new Set(cart.items.map((i) => i.product.storeId))];
   if (storeIds.length > 1) {
@@ -944,6 +969,11 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
       emailSubject: "New market order",
       emailText: mpEmail(null, [`You received a new order: ${orderTitle} · ${formatMoney(currency, totalMinor)}.`]),
     });
+    try {
+      await createOrderFreightQuote(order.id, req.user!.id);
+    } catch {
+      /* order stands; buyer can retry from ship confirm screen */
+    }
     if (body.success && (body.data.addressLabel || body.data.addressLine)) {
       const prefBody = [
         body.data.deliveryMethod === "DOORSTEP" ? "Doorstep delivery" : "Warehouse pickup",
@@ -970,10 +1000,60 @@ marketRouter.post("/checkout", requireAuth, async (req, res) => {
 marketRouter.get("/orders", requireAuth, async (req, res) => {
   const orders = await prisma.marketOrder.findMany({
     where: { userId: req.user!.id },
-    include: { items: true },
+    include: {
+      items: true,
+      shipment: { select: { id: true, ref: true, route: true, status: true, eta: true } },
+    },
     orderBy: { createdAt: "desc" },
   });
-  return ok(res, serialize(orders));
+  return ok(
+    res,
+    serialize(
+      orders.map((order) => ({
+        ...order,
+        shipment: shipmentSummary(order.shipment),
+        logisticsNextAction: orderLogisticsNextAction(order),
+      })),
+    ),
+  );
+});
+
+marketRouter.post("/orders/:id/freight-quote", requireAuth, async (req, res) => {
+  const orderId = param(req, "id");
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: orderId, userId: req.user!.id },
+  });
+  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+
+  let quote = await prisma.shippingQuote.findFirst({
+    where: {
+      request: { orderId, userId: req.user!.id },
+      shipment: null,
+      validUntil: { gt: new Date() },
+    },
+    include: { partner: true, request: true },
+    orderBy: { estimatedMinor: "asc" },
+  });
+
+  if (!quote) {
+    const created = await createOrderFreightQuote(orderId, req.user!.id);
+    if (!created) return ok(res, null);
+    quote = await prisma.shippingQuote.findFirst({
+      where: { id: created.id },
+      include: { partner: true, request: true },
+    });
+  }
+
+  if (!quote) return ok(res, null);
+
+  return ok(
+    res,
+    serialize({
+      ...serializeQuoteForCompare(quote, quote.request),
+      requestId: quote.requestId,
+      request: quote.request,
+    }),
+  );
 });
 
 marketRouter.get("/orders/:id", requireAuth, async (req, res) => {

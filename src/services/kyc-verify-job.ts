@@ -9,7 +9,7 @@ function payloadRecord(raw: unknown) {
 export async function processKycVerification(applicationId: string) {
   const app = await prisma.kycApplication.findUnique({
     where: { id: applicationId },
-    include: { user: { select: { id: true, name: true, email: true } } },
+    include: { user: { select: { id: true, name: true, email: true, dateOfBirth: true } } },
   });
   if (!app || app.status !== "SUBMITTED") return;
 
@@ -34,8 +34,12 @@ export async function processKycVerification(applicationId: string) {
   });
 
   const profileName = app.user.name?.trim() || "User";
+  const profileDob = app.user.dateOfBirth
+    ? app.user.dateOfBirth.toISOString().slice(0, 10)
+    : null;
+  const profile = { name: profileName, dateOfBirth: profileDob };
   const result =
-    app.type === "BVN" ? await verifyBvn(number, profileName) : await verifyNin(number, profileName);
+    app.type === "BVN" ? await verifyBvn(number, profile) : await verifyNin(number, profile);
 
   if (result.ok) {
     await prisma.kycApplication.update({

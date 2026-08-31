@@ -166,6 +166,7 @@ model User {
   role            UserRole     @default(BUYER)
   platformRole    PlatformRole @default(USER)
   name            String       @default("")
+  dateOfBirth     DateTime?    @db.Date
   avatarUrl       String?
   onboardingDone  Boolean      @default(false)
   locale          String       @default("en")

@@ -22,6 +22,41 @@ function exposeDebugCode() {
   return process.env.NODE_ENV !== "production" && !isSmtpConfigured();
 }
 
+authRouter.get("/signup/availability", async (req, res) => {
+  const phoneRaw = typeof req.query.phone === "string" ? req.query.phone : undefined;
+  const emailRaw = typeof req.query.email === "string" ? req.query.email : undefined;
+
+  const result: {
+    phone?: { available: boolean; message?: string };
+    email?: { available: boolean; message?: string };
+  } = {};
+
+  if (phoneRaw) {
+    const phone = normalizePhone(phoneRaw);
+    if (phone.length >= 8) {
+      const owner = await prisma.user.findUnique({ where: { phone }, select: { id: true } });
+      result.phone = owner
+        ? { available: false, message: "This phone number is already registered. Log in instead." }
+        : { available: true };
+    }
+  }
+
+  if (emailRaw) {
+    const email = normalizeEmail(emailRaw);
+    if (isValidEmail(email)) {
+      const owner = await prisma.user.findUnique({ where: { email }, select: { id: true, phone: true } });
+      const phone = phoneRaw ? normalizePhone(phoneRaw) : undefined;
+      const sameAccount = owner && phone && owner.phone === phone;
+      result.email =
+        owner && !sameAccount
+          ? { available: false, message: "This email is already registered with another account" }
+          : { available: true };
+    }
+  }
+
+  return ok(res, result);
+});
+
 authRouter.post("/otp/request", async (req, res) => {
   const body = z
     .object({
@@ -58,6 +93,11 @@ authRouter.post("/otp/request", async (req, res) => {
     return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
   }
 
+  const phoneOwner = await prisma.user.findUnique({ where: { phone } });
+  if (phoneOwner && body.data.email) {
+    return fail(res, 400, "PHONE_IN_USE", "This phone number is already registered. Log in instead.");
+  }
+
   const code = String(randomInt(100000, 999999));
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   await prisma.otpChallenge.create({
@@ -85,7 +125,7 @@ authRouter.post("/otp/verify", async (req, res) => {
       phone: z.string(),
       code: z.string().length(6),
       email: z.string().email().optional(),
-      role: z.enum(["BUYER", "SELLER", "BOTH"]).optional(),
+      role: z.enum(["BUYER", "SELLER"]).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit code required");
