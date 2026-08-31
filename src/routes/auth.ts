@@ -22,6 +22,12 @@ function exposeDebugCode() {
   return process.env.NODE_ENV !== "production" && !isSmtpConfigured();
 }
 
+const WEAK_PASSCODES = new Set(["123456", "000000", "111111", "654321", "121212", "123123", "112233"]);
+
+function rejectWeakPasscode(passcode: string) {
+  return WEAK_PASSCODES.has(passcode);
+}
+
 authRouter.get("/signup/availability", async (req, res) => {
   const phoneRaw = typeof req.query.phone === "string" ? req.query.phone : undefined;
   const emailRaw = typeof req.query.email === "string" ? req.query.email : undefined;
@@ -193,6 +199,9 @@ authRouter.post("/otp/verify", async (req, res) => {
 authRouter.post("/passcode/set", async (req, res) => {
   const body = z.object({ phone: z.string(), passcode: z.string().length(6) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit passcode required");
+  if (rejectWeakPasscode(body.data.passcode)) {
+    return fail(res, 400, "WEAK_PASSCODE", "Choose a passcode that's harder to guess — avoid 123456 and similar patterns");
+  }
   const phone = normalizePhone(body.data.phone);
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
@@ -218,7 +227,15 @@ authRouter.post("/login", async (req, res) => {
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and passcode required");
   const phone = normalizePhone(body.data.phone);
   const user = await prisma.user.findUnique({ where: { phone } });
-  if (!user?.passcodeHash) return fail(res, 401, "INVALID_CREDENTIALS", "Wrong phone or passcode");
+  if (!user) return fail(res, 401, "INVALID_CREDENTIALS", "Wrong phone or passcode");
+  if (!user.passcodeHash) {
+    return fail(
+      res,
+      401,
+      "PASSCODE_NOT_SET",
+      "No passcode on this account yet. Use Forgot passcode to create one.",
+    );
+  }
   const match = await bcrypt.compare(body.data.passcode, user.passcodeHash);
   if (!match) return fail(res, 401, "INVALID_CREDENTIALS", "Wrong phone or passcode");
 
