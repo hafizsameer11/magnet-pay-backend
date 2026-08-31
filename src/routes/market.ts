@@ -21,7 +21,7 @@ import {
   REQUIRED_SELLER_DOC_KINDS,
 } from "../services/order-docs.js";
 import { mpEmail, notifyUser, notifyUsers } from "../services/user-notify.js";
-import { parseProductSearchQuery, searchProducts } from "../services/product-search.js";
+import { unitMinorForProduct } from "../services/product-pricing.js";
 
 export const marketRouter = Router();
 
@@ -160,10 +160,11 @@ async function syncProductVariants(
 }
 
 function unitMinorForCartItem(item: {
-  product: { priceMinor: bigint };
+  qty: number;
+  product: { priceMinor: bigint; pricingTiers?: unknown; moq?: string | null };
   variant?: { priceMinor: bigint } | null;
 }) {
-  return item.variant?.priceMinor ?? item.product.priceMinor;
+  return unitMinorForProduct(item.product, item.qty, item.variant);
 }
 
 async function sellerStoreFor(userId: string) {
