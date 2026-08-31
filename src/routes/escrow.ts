@@ -135,6 +135,33 @@ escrowRouter.get("/meta/lookup", requireAuth, async (req, res) => {
   return fail(res, 400, "VALIDATION", "email or phone required");
 });
 
+escrowRouter.get("/invites/pending", requireAuth, async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user!.id },
+    select: { email: true },
+  });
+  if (!user?.email) return ok(res, []);
+  const email = normalizeEmail(user.email);
+  const invites = await prisma.escrowInvite.findMany({
+    where: {
+      email,
+      acceptedByUserId: null,
+      expiresAt: { gt: new Date() },
+      escrow: { status: "AWAITING_SELLER" },
+    },
+    include: {
+      escrow: {
+        include: {
+          milestones: { orderBy: { sortOrder: "asc" } },
+          buyer: { select: { id: true, name: true, phone: true } },
+        },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  return ok(res, serialize(invites));
+});
+
 escrowRouter.get("/invite/lookup", async (req, res) => {
   const code = String(req.query.code ?? "").trim().toLowerCase().replace(/[^a-f0-9]/g, "");
   if (code.length < 8) return fail(res, 400, "VALIDATION", "Invite code too short");
