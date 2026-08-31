@@ -421,9 +421,16 @@ messagesRouter.post("/conversations/:id/messages", requireAuth, async (req, res)
 
 messagesRouter.post("/support", requireAuth, async (req, res) => {
   const body = z
-    .object({ topic: z.string().min(2), message: z.string().min(1) })
+    .object({
+      topic: z.string().min(2),
+      message: z.string().optional().default(""),
+      attachmentUrl: z.string().min(1).optional().nullable(),
+    })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "topic and message required");
+  const text = (body.data.message ?? "").trim();
+  const attachmentUrl = body.data.attachmentUrl || null;
+  if (!text && !attachmentUrl) return fail(res, 400, "VALIDATION", "message or attachment required");
   const admin = await prisma.user.findFirst({
     where: {
       OR: [
@@ -449,11 +456,13 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
 
   if (existing) {
+    const msgBody = text ? `[${body.data.topic}] ${text}` : `[${body.data.topic}] Attachment`;
     const msg = await prisma.message.create({
       data: {
         conversationId: existing.conversationId,
         senderId: req.user!.id,
-        body: `[${body.data.topic}] ${body.data.message}`,
+        body: msgBody,
+        attachmentUrl,
       },
     });
     await upsertSupportTicketRecord({
@@ -466,7 +475,7 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
     if (admin) {
       notifyUser(admin.id, {
         title: "Support message",
-        body: `[${body.data.topic}] ${body.data.message.slice(0, 120)}`,
+        body: `[${body.data.topic}] ${(text || "Attachment").slice(0, 120)}`,
         href: `/messages/${existing.conversationId}`,
       });
     }
@@ -485,7 +494,8 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
       data: {
         conversationId: c.id,
         senderId: req.user!.id,
-        body: body.data.message,
+        body: text || "Attachment",
+        attachmentUrl,
       },
     });
     return { conversationId: c.id, message: msg };
@@ -499,7 +509,7 @@ messagesRouter.post("/support", requireAuth, async (req, res) => {
   }).catch(() => {});
   notifyUser(admin.id, {
     title: "New support ticket",
-    body: `[${body.data.topic}] ${body.data.message.slice(0, 120)}`,
+    body: `[${body.data.topic}] ${(text || "Attachment").slice(0, 120)}`,
     href: `/messages/${conv.conversationId}`,
   });
   return ok(res, serialize(conv), 201);

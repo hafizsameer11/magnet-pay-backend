@@ -398,8 +398,16 @@ export function registerAdminExtensions(router: Router) {
   });
 
   router.post("/conversations/:id/messages", async (req, res) => {
-    const body = z.object({ body: z.string().min(1) }).safeParse(req.body);
-    if (!body.success) return fail(res, 400, "VALIDATION", "body required");
+    const body = z
+      .object({
+        body: z.string().optional().default(""),
+        attachmentUrl: z.string().min(1).optional().nullable(),
+      })
+      .safeParse(req.body);
+    if (!body.success) return fail(res, 400, "VALIDATION", "Invalid message");
+    const text = (body.data.body ?? "").trim();
+    const attachmentUrl = body.data.attachmentUrl || null;
+    if (!text && !attachmentUrl) return fail(res, 400, "VALIDATION", "body or attachment required");
     const conversationId = param(req, "id");
     const conv = await prisma.conversation.findUnique({ where: { id: conversationId } });
     if (!conv) return fail(res, 404, "NOT_FOUND", "Conversation not found");
@@ -415,7 +423,8 @@ export function registerAdminExtensions(router: Router) {
       data: {
         conversationId,
         senderId: req.user!.id,
-        body: body.data.body,
+        body: text || "Attachment",
+        attachmentUrl,
       },
     });
     await prisma.conversation.update({
@@ -424,7 +433,7 @@ export function registerAdminExtensions(router: Router) {
     });
     void notifyConversationPeers(conversationId, req.user!.id, {
       title: "New message",
-      body: body.data.body.slice(0, 120),
+      body: (text || "Attachment").slice(0, 120),
       href: `/messages/${conversationId}`,
     });
     return ok(res, serialize(msg), 201);
