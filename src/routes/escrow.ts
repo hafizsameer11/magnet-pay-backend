@@ -93,7 +93,11 @@ escrowRouter.get("/", requireAuth, async (req, res) => {
     where: {
       OR: [{ buyerId: req.user!.id }, { sellerId: req.user!.id }],
     },
-    include: { milestones: { orderBy: { sortOrder: "asc" } } },
+    include: {
+      milestones: { orderBy: { sortOrder: "asc" } },
+      buyer: { select: { id: true, name: true } },
+      seller: { select: { id: true, name: true } },
+    },
     orderBy: { createdAt: "desc" },
   });
   return ok(res, serialize(rows));
@@ -524,13 +528,17 @@ escrowRouter.post("/:id/milestones/:msId/release", requireAuth, async (req, res)
   const inspectionGate = inspectionReleaseGate(
     inspection ? { status: inspection.status, inspectorId: inspection.inspectorId } : null,
   );
+  const [orderStatus, docCount] = await Promise.all([
+    prisma.marketOrder.findFirst({ where: { escrowId: escrow.id }, select: { status: true } }).then((o) => o?.status ?? null),
+    prisma.escrowDocument.count({ where: { escrowId: escrow.id } }),
+  ]);
   const gate = releaseGate({
     milestoneStatus: ms.status,
     releaseRequestedAt: ms.releaseRequestedAt,
-    orderStatus: (await prisma.marketOrder.findFirst({ where: { escrowId: escrow.id }, select: { status: true } }))
-      ?.status ?? null,
+    orderStatus,
     inspectionOk: inspectionGate.ok,
     inspectionReason: inspectionGate.reason,
+    hasDocuments: docCount > 0,
   });
   if (!gate.canRelease) {
     return fail(res, 400, "NOT_READY", gate.waitReason ?? "Seller has not confirmed shipment yet");
@@ -652,6 +660,18 @@ escrowRouter.post("/:id/documents", requireAuth, async (req, res) => {
   const doc = await prisma.escrowDocument.create({
     data: { escrowId: escrow.id, name: body.data.name, url: body.data.url },
   });
+  if (req.user!.id === escrow.sellerId) {
+    const funded = await prisma.escrowMilestone.findFirst({
+      where: { escrowId: escrow.id, status: "FUNDED", releaseRequestedAt: null },
+      orderBy: { sortOrder: "asc" },
+    });
+    if (funded) {
+      await prisma.escrowMilestone.update({
+        where: { id: funded.id },
+        data: { releaseRequestedAt: new Date() },
+      });
+    }
+  }
   const peerId = req.user!.id === escrow.buyerId ? escrow.sellerId : escrow.buyerId;
   if (peerId) {
     notifyUser(peerId, {

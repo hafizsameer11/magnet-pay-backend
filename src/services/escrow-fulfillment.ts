@@ -9,6 +9,8 @@ export type Fulfillment = {
   canRelease: boolean;
   waitReason: string | null;
   inspectionStatus: string | null;
+  releaseRequested: boolean;
+  sellerShipped: boolean;
 };
 
 export function releaseGate(input: {
@@ -17,6 +19,7 @@ export function releaseGate(input: {
   orderStatus: string | null;
   inspectionOk?: boolean;
   inspectionReason?: string | null;
+  hasDocuments?: boolean;
 }): { canRelease: boolean; waitReason: string | null } {
   if (input.milestoneStatus !== "FUNDED") {
     return { canRelease: false, waitReason: "This milestone is not funded yet." };
@@ -42,10 +45,11 @@ export function releaseGate(input: {
     }
     return { canRelease: false, waitReason: `Cannot release while order is ${input.orderStatus}.` };
   }
-  if (!input.releaseRequestedAt) {
+  const sellerReady = Boolean(input.releaseRequestedAt) || Boolean(input.hasDocuments);
+  if (!sellerReady) {
     return {
       canRelease: false,
-      waitReason: "Waiting for the buyer to confirm delivery (proof of delivery).",
+      waitReason: "Waiting for the seller to confirm shipment and request release.",
     };
   }
   return { canRelease: true, waitReason: null };
@@ -55,15 +59,22 @@ export async function fulfillmentForEscrow(escrowId: string, milestone?: {
   status: string;
   releaseRequestedAt?: Date | null;
 }): Promise<Fulfillment> {
-  const order = await prisma.marketOrder.findFirst({
-    where: { escrowId },
-    select: { id: true, status: true },
-  });
-  const inspection = await getActiveInspection(escrowId);
+  const [order, inspection, docCount] = await Promise.all([
+    prisma.marketOrder.findFirst({
+      where: { escrowId },
+      select: { id: true, status: true },
+    }),
+    getActiveInspection(escrowId),
+    prisma.escrowDocument.count({ where: { escrowId } }),
+  ]);
   const inspectionGate = inspectionReleaseGate(
     inspection ? { status: inspection.status, inspectorId: inspection.inspectorId } : null,
   );
   const orderStatus = order?.status ?? null;
+  const releaseRequested = Boolean(milestone?.releaseRequestedAt);
+  const sellerShipped = orderStatus
+    ? orderStatus === "SHIPPED" || orderStatus === "DELIVERED" || orderStatus === "COMPLETED"
+    : releaseRequested || docCount > 0;
   const gate = milestone
     ? releaseGate({
         milestoneStatus: milestone.status,
@@ -71,6 +82,7 @@ export async function fulfillmentForEscrow(escrowId: string, milestone?: {
         orderStatus,
         inspectionOk: inspectionGate.ok,
         inspectionReason: inspectionGate.reason,
+        hasDocuments: docCount > 0,
       })
     : { canRelease: false, waitReason: null };
   return {
@@ -81,5 +93,7 @@ export async function fulfillmentForEscrow(escrowId: string, milestone?: {
     canRelease: gate.canRelease,
     waitReason: gate.waitReason,
     inspectionStatus: inspection?.status ?? null,
+    releaseRequested,
+    sellerShipped,
   };
 }
