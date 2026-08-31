@@ -19,11 +19,9 @@ export async function ngnDailyCapMinor(userId: string) {
 
   if (kyc.status === "REJECTED") return 0n;
 
-  if (kyc.approved && kyc.tier >= 2) {
+  // Approved buyers (BVN/NIN via Prembly) get the full verified daily cap.
+  if (kyc.approved) {
     return BigInt(config.ngnTier2DailyCapMinor);
-  }
-  if (kyc.approved && kyc.tier >= 1) {
-    return BigInt(config.ngnTier1DailyCapMinor);
   }
   if (kyc.status === "SUBMITTED" && config.allowBasicWhilePending) {
     return BigInt(config.ngnTier1DailyCapMinor);

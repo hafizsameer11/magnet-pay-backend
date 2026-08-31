@@ -1154,9 +1154,9 @@ model ComplianceLimits {
   cnyDailyCapMinor          Int      @default(20000000)
   minTierDeposit            Int      @default(1)
   minTierWithdraw           Int      @default(1)
-  minTierCrossBorder        Int      @default(2)
-  minTierMarketCheckout     Int      @default(2)
-  minTierLogistics          Int      @default(2)
+  minTierCrossBorder        Int      @default(1)
+  minTierMarketCheckout     Int      @default(1)
+  minTierLogistics          Int      @default(1)
   allowBasicWhilePending    Boolean  @default(true)
   updatedAt                 DateTime @updatedAt
 }

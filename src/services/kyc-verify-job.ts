@@ -46,7 +46,7 @@ export async function processKycVerification(applicationId: string) {
       where: { id: app.id },
       data: {
         status: "APPROVED",
-        tier: Math.max(1, app.tier),
+        tier: 1,
         payload: {
           ...payload,
           number,

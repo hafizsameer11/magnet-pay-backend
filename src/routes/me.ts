@@ -102,12 +102,15 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
     premblyStatus: "queued",
   };
 
+  const tier =
+    body.data.type === "BVN" || body.data.type === "NIN" ? 1 : body.data.tier;
+
   const app = open
     ? await prisma.kycApplication.update({
         where: { id: open.id },
         data: {
           type: body.data.type,
-          tier: body.data.tier,
+          tier,
           payload: inputJson(mergedPayload),
           status: "SUBMITTED",
         },
@@ -116,7 +119,7 @@ meRouter.post("/kyc", requireAuth, async (req, res) => {
         data: {
           userId: req.user!.id,
           type: body.data.type,
-          tier: body.data.tier,
+          tier,
           payload: inputJson(mergedPayload),
           status: "SUBMITTED",
         },
