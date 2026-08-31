@@ -25,15 +25,65 @@ import { parseProductSearchQuery, searchProducts } from "../services/product-sea
 
 export const marketRouter = Router();
 
+const emptyToUndefined = (v: unknown) => (v === "" ? undefined : v);
+const emptyToNull = (v: unknown) => (v === "" ? null : v);
+
+const optionalUuid = z.preprocess(emptyToNull, z.string().uuid().nullable().optional());
+const optionalUrl = z.preprocess(emptyToNull, z.string().url().nullable().optional());
+const optionalNonEmptyString = z.preprocess(emptyToUndefined, z.string().min(1).optional());
+
+function validationMessage(error: z.ZodError, fallback = "Invalid product") {
+  const issue = error.issues[0];
+  if (!issue) return fallback;
+  const path = issue.path.length ? issue.path.join(".") : "body";
+  return `${path}: ${issue.message}`;
+}
+
 const productShippingSchema = {
   cbmPerUnit: z.number().positive().optional(),
   weightKgPerUnit: z.number().positive().optional(),
-  originHub: z.string().min(1).optional(),
+  originHub: optionalNonEmptyString,
   leadTimeMin: z.number().int().nonnegative().optional(),
   leadTimeMax: z.number().int().nonnegative().optional(),
-  packagingType: z.string().min(1).optional(),
-  defaultIncoterm: z.string().min(2).optional(),
-  parcelTypeId: z.string().uuid().optional().nullable(),
+  packagingType: optionalNonEmptyString,
+  defaultIncoterm: optionalNonEmptyString,
+  parcelTypeId: optionalUuid,
+};
+
+const sellerProductCreateFields = {
+  description: z.string().optional(),
+  priceMinor: z.union([z.string(), z.number()]),
+  currency: z.enum(["NGN", "CNY", "USD"]).default("USD"),
+  imageUrl: optionalUrl,
+  moq: z.string().optional(),
+  categoryId: optionalUuid,
+  mediaUrls: z.array(z.string().url()).optional(),
+  active: z.boolean().optional(),
+  stock: z.number().int().nonnegative().optional().nullable(),
+  variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+  variants: z.array(variantInputSchema).optional(),
+  pricingTiers: z
+    .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
+    .optional(),
+  ...productShippingSchema,
+};
+
+const sellerProductPatchFields = {
+  description: z.string().optional().nullable(),
+  priceMinor: z.union([z.string(), z.number()]).optional(),
+  currency: z.enum(["NGN", "CNY", "USD"]).optional(),
+  imageUrl: optionalUrl,
+  moq: z.string().optional(),
+  categoryId: optionalUuid,
+  mediaUrls: z.array(z.string().url()).optional(),
+  active: z.boolean().optional(),
+  stock: z.number().int().nonnegative().optional().nullable(),
+  variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
+  variants: z.array(variantInputSchema).optional(),
+  pricingTiers: z
+    .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
+    .optional(),
+  ...productShippingSchema,
 };
 
 function orderLogisticsNextAction(order: {
@@ -232,24 +282,10 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
   const body = z
     .object({
       title: z.string().min(2),
-      description: z.string().optional(),
-      priceMinor: z.union([z.string(), z.number()]),
-      currency: z.enum(["NGN", "CNY", "USD"]).default("USD"),
-      imageUrl: z.string().url().optional().nullable(),
-      moq: z.string().optional(),
-      categoryId: z.string().uuid().optional().nullable(),
-      mediaUrls: z.array(z.string().url()).optional(),
-      active: z.boolean().optional(),
-      stock: z.number().int().nonnegative().optional().nullable(),
-      variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
-      variants: z.array(variantInputSchema).optional(),
-      pricingTiers: z
-        .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
-        .optional(),
-      ...productShippingSchema,
+      ...sellerProductCreateFields,
     })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
+  if (!body.success) return fail(res, 400, "VALIDATION", validationMessage(body.error));
   const store = await ensureSellerStore(req.user!.id);
   const canPublishLive = await sellerCanPublishLive(req.user!.id);
   const wantsActive = body.data.active ?? true;
@@ -315,23 +351,10 @@ marketRouter.patch("/seller/products/:id", requireAuth, requireSellerKyb, async 
   const body = z
     .object({
       title: z.string().min(2).optional(),
-      description: z.string().optional().nullable(),
-      priceMinor: z.union([z.string(), z.number()]).optional(),
-      imageUrl: z.string().url().optional().nullable(),
-      moq: z.string().optional(),
-      categoryId: z.string().uuid().optional().nullable(),
-      active: z.boolean().optional(),
-      mediaUrls: z.array(z.string().url()).optional(),
-      stock: z.number().int().nonnegative().optional().nullable(),
-      variantAxes: z.array(z.object({ name: z.string(), values: z.array(z.string()) })).optional(),
-      variants: z.array(variantInputSchema).optional(),
-      pricingTiers: z
-        .array(z.object({ from: z.string(), to: z.string().optional(), priceMinor: z.union([z.string(), z.number()]) }))
-        .optional(),
-      ...productShippingSchema,
+      ...sellerProductPatchFields,
     })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid product");
+  if (!body.success) return fail(res, 400, "VALIDATION", validationMessage(body.error));
   const product = await prisma.$transaction(async (tx) => {
     const p = await tx.product.update({
       where: { id: existing.id },

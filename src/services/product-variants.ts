@@ -3,12 +3,14 @@ import { z } from "zod";
 export type VariantAxis = { name: string; values: string[] };
 export type VariantOptions = Record<string, string>;
 
+const emptyToNull = (v: unknown) => (v === "" ? null : v);
+
 export const variantInputSchema = z.object({
-  sku: z.string().optional(),
+  sku: z.preprocess((v) => (v === "" ? undefined : v), z.string().optional()),
   options: z.record(z.string(), z.string()),
   priceMinor: z.union([z.string(), z.number()]),
-  stock: z.number().int().nonnegative().optional().nullable(),
-  imageUrl: z.string().url().optional().nullable(),
+  stock: z.preprocess(emptyToNull, z.number().int().nonnegative().nullable().optional()),
+  imageUrl: z.preprocess(emptyToNull, z.string().url().nullable().optional()),
 });
 
 export function variantKeyFromOptions(options: VariantOptions): string {
