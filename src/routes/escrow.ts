@@ -241,6 +241,7 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
       milestones: z
         .array(z.object({ label: z.string(), amountMinor: z.union([z.string(), z.number()]) }))
         .optional(),
+      termsDocument: z.object({ name: z.string().min(1), url: z.string().url() }).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid escrow");
@@ -320,6 +321,15 @@ escrowRouter.post("/", requireAuth, async (req, res) => {
           email: inviteEmail,
           token: inviteToken,
           expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+        },
+      });
+    }
+    if (body.data.termsDocument) {
+      await tx.escrowDocument.create({
+        data: {
+          escrowId: e.id,
+          name: body.data.termsDocument.name,
+          url: body.data.termsDocument.url,
         },
       });
     }

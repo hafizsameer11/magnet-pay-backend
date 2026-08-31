@@ -139,7 +139,7 @@ walletsRouter.post("/deposit", requireAuth, async (req, res) => {
     notifyUser(req.user!.id, {
       title: "Wallet funded",
       body: `+${formatMoney(body.data.currency, amountMinor)} via ${body.data.method}`,
-      href: "/wallet",
+      href: "/deposit",
       emailPref: "emailTransfers",
       emailSubject: "Wallet funded",
       emailText: mpEmail(user?.name, [
@@ -232,7 +232,7 @@ walletsRouter.post("/withdraw", requireAuth, async (req, res) => {
     notifyUser(req.user!.id, {
       title: "Withdrawal submitted",
       body: `−${formatMoney(body.data.currency, amountMinor)} to ${body.data.destination}`,
-      href: "/wallet",
+      href: "/deposit",
       emailPref: "emailTransfers",
       emailSubject: "Withdrawal submitted",
       emailText: mpEmail(null, [
@@ -347,7 +347,7 @@ walletsRouter.post("/fx/convert", requireAuth, async (req, res) => {
     notifyUser(req.user!.id, {
       title: "Currency converted",
       body: `${formatMoney(body.data.from as Currency, fromMinor)} → ${formatMoney(body.data.to as Currency, quoteRes.toMinor)}`,
-      href: "/wallet",
+      href: "/deposit",
       emailPref: "emailTransfers",
       emailSubject: "Currency converted",
       emailText: mpEmail(null, [

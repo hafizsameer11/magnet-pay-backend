@@ -296,7 +296,7 @@ export async function consumeHold(
 
 export function formatMoney(currency: Currency, minor: bigint): string {
   const n = Number(minor) / 100;
-  if (currency === "NGN") return `₦${n.toLocaleString("en-NG", { minimumFractionDigits: 2 })}`;
+  if (currency === "NGN") return `₦${n.toLocaleString("en-NG", { maximumFractionDigits: 0 })}`;
   if (currency === "CNY") return `¥${n.toLocaleString("en-US", { minimumFractionDigits: 2 })}`;
   return `$${n.toLocaleString("en-US", { minimumFractionDigits: 2 })}`;
 }
