@@ -22,12 +22,6 @@ function exposeDebugCode() {
   return process.env.NODE_ENV !== "production" && !isSmtpConfigured();
 }
 
-const WEAK_PASSCODES = new Set(["123456", "000000", "111111", "654321", "121212", "123123", "112233"]);
-
-function rejectWeakPasscode(passcode: string) {
-  return WEAK_PASSCODES.has(passcode);
-}
-
 authRouter.get("/signup/availability", async (req, res) => {
   const phoneRaw = typeof req.query.phone === "string" ? req.query.phone : undefined;
   const emailRaw = typeof req.query.email === "string" ? req.query.email : undefined;
@@ -93,15 +87,10 @@ authRouter.post("/otp/request", async (req, res) => {
     email = normalizeEmail(existing.email);
   }
 
-  // Signup path: email must not already belong to another phone
+  // Signup-only: email must not belong to a different phone (forgot-passcode omits email or uses account email)
   const emailOwner = await prisma.user.findUnique({ where: { email } });
   if (emailOwner && emailOwner.phone !== phone) {
     return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
-  }
-
-  const phoneOwner = await prisma.user.findUnique({ where: { phone } });
-  if (phoneOwner && body.data.email) {
-    return fail(res, 400, "PHONE_IN_USE", "This phone number is already registered. Log in instead.");
   }
 
   const code = String(randomInt(100000, 999999));
@@ -199,9 +188,6 @@ authRouter.post("/otp/verify", async (req, res) => {
 authRouter.post("/passcode/set", async (req, res) => {
   const body = z.object({ phone: z.string(), passcode: z.string().length(6) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit passcode required");
-  if (rejectWeakPasscode(body.data.passcode)) {
-    return fail(res, 400, "WEAK_PASSCODE", "Choose a passcode that's harder to guess — avoid 123456 and similar patterns");
-  }
   const phone = normalizePhone(body.data.phone);
   const user = await prisma.user.findUnique({ where: { phone } });
   if (!user) return fail(res, 404, "NOT_FOUND", "User not found");
