@@ -1017,7 +1017,7 @@ adminRouter.get("/ledger", async (_req, res) => {
 adminRouter.get("/orders", async (_req, res) => {
   const rows = await prisma.marketOrder.findMany({
     include: {
-      items: true,
+      items: { include: { product: { select: { id: true, title: true, imageUrl: true } } } },
       user: { select: userSelect },
     },
     orderBy: { createdAt: "desc" },
