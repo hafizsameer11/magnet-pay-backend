@@ -1,4 +1,5 @@
 import { prisma } from "../lib/prisma.js";
+import { ensureLegalPagesSeed } from "./legal-content.js";
 
 type SeedRow = {
   domain: string;
@@ -109,4 +110,5 @@ export async function seedAdminRecords() {
       },
     });
   }
+  await ensureLegalPagesSeed();
 }

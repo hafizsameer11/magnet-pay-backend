@@ -9,6 +9,7 @@ import { logisticsRouter } from "./routes/logistics.js";
 import { marketRouter } from "./routes/market.js";
 import { adminRouter, messagesRouter, notificationsRouter } from "./routes/admin.js";
 import { uploadsRouter } from "./routes/uploads.js";
+import { contentRouter } from "./routes/content.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,6 +57,7 @@ export function createApp() {
   app.use("/messages", messagesRouter);
   app.use("/admin", adminRouter);
   app.use("/uploads", uploadsRouter);
+  app.use("/content", contentRouter);
   app.use("/files", express.static(UPLOAD_DIR));
   app.use("/files/seed", express.static(SEED_MEDIA_DIR));
 

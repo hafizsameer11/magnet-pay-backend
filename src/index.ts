@@ -4,6 +4,7 @@ import {
   ensureDefaultFxFeeConfig,
   syncFeeConfigRatesToFxTable,
 } from "./services/fx-rates-sync.js";
+import { ensureLegalPagesSeed } from "./services/legal-content.js";
 
 const port = Number(env("PORT", "4000"));
 const host = env("HOST", "0.0.0.0");
@@ -16,9 +17,14 @@ async function bootstrapFxRates() {
   }
 }
 
+async function bootstrapLegalContent() {
+  await ensureLegalPagesSeed();
+}
+
 async function main() {
   try {
     await bootstrapFxRates();
+    await bootstrapLegalContent();
   } catch (err) {
     console.error("FX bootstrap failed (API will still start):", err);
   }
