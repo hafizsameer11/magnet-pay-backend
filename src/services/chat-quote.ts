@@ -59,6 +59,19 @@ export async function getConversationContext(conversationId: string, userId: str
     };
   }
 
+  let peerStore: { id: string; name: string } | null = null;
+  if (peer && !isSupport) {
+    if (product?.store?.userId === peer.id) {
+      peerStore = { id: product.store.id, name: product.store.name };
+    } else if (peer.role === "SELLER" || peer.role === "BOTH") {
+      const store = await prisma.sellerStore.findUnique({
+        where: { userId: peer.id },
+        select: { id: true, name: true },
+      });
+      if (store) peerStore = store;
+    }
+  }
+
   return {
     conversation: conv,
     peer,
@@ -67,6 +80,7 @@ export async function getConversationContext(conversationId: string, userId: str
     amSeller,
     isSupport,
     supportMeta,
+    peerStore,
   };
 }
 
