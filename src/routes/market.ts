@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { v4 as uuidv4 } from "uuid";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import {fail, ok, requireAuth, serialize, param, inputJson } from "../lib/http.js";
 import { formatMoney, lockToHold, recordTx, settleEscrowRelease } from "../services/ledger.js";
@@ -176,6 +177,41 @@ async function sellerStoreFor(userId: string) {
     include: { store: true },
   });
   return membership?.store ?? null;
+}
+
+/** Match orders owned by this seller even if supplier field is stale. */
+async function sellerOrderAccessWhere(
+  store: { id: string; name: string },
+  sellerUserId: string,
+): Promise<Prisma.MarketOrderWhereInput> {
+  const escrowIds = await prisma.escrow.findMany({
+    where: { sellerId: sellerUserId },
+    select: { id: true },
+  });
+  const or: Prisma.MarketOrderWhereInput[] = [
+    { supplier: store.id },
+    { supplier: store.name },
+    { items: { some: { product: { storeId: store.id } } } },
+  ];
+  if (escrowIds.length) {
+    or.push({ escrowId: { in: escrowIds.map((e) => e.id) } });
+  }
+  return { OR: or };
+}
+
+async function findSellerOrder(
+  sellerUserId: string,
+  orderId: string,
+  include?: Prisma.MarketOrderInclude,
+) {
+  const store = await sellerStoreFor(sellerUserId);
+  if (!store) return { store: null, order: null };
+  const access = await sellerOrderAccessWhere(store, sellerUserId);
+  const order = await prisma.marketOrder.findFirst({
+    where: { id: orderId, ...access },
+    include,
+  });
+  return { store, order };
 }
 
 async function ensureSellerStore(userId: string, name?: string) {
@@ -435,8 +471,9 @@ marketRouter.delete("/seller/products/:id", requireAuth, async (req, res) => {
 marketRouter.get("/seller/orders", requireAuth, async (req, res) => {
   const store = await sellerStoreFor(req.user!.id);
   if (!store) return ok(res, []);
+  const access = await sellerOrderAccessWhere(store, req.user!.id);
   const orders = await prisma.marketOrder.findMany({
-    where: { OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: access,
     include: {
       items: true,
       user: { select: { id: true, name: true, phone: true, avatarUrl: true } },
@@ -447,14 +484,9 @@ marketRouter.get("/seller/orders", requireAuth, async (req, res) => {
 });
 
 marketRouter.get("/seller/orders/:id", requireAuth, async (req, res) => {
-  const store = await sellerStoreFor(req.user!.id);
-  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
-  const order = await prisma.marketOrder.findFirst({
-    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
-    include: {
-      items: { include: { product: true } },
-      user: { select: { id: true, name: true, phone: true, avatarUrl: true, email: true } },
-    },
+  const { order } = await findSellerOrder(req.user!.id, param(req, "id"), {
+    items: { include: { product: true } },
+    user: { select: { id: true, name: true, phone: true, avatarUrl: true, email: true } },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   return ok(res, serialize(order));
@@ -472,8 +504,9 @@ marketRouter.patch("/seller/orders/:id", requireAuth, requireSellerKyb, async (r
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid update");
+  const access = await sellerOrderAccessWhere(store, req.user!.id);
   const order = await prisma.marketOrder.findFirst({
-    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
+    where: { id: param(req, "id"), ...access },
   });
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   if (body.data.status === "SHIPPED") {
@@ -608,24 +641,16 @@ marketRouter.put("/seller/templates", requireAuth, requireSellerKyb, async (req,
 });
 
 marketRouter.get("/seller/orders/:id/documents", requireAuth, async (req, res) => {
-  const store = await sellerStoreFor(req.user!.id);
-  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
-  const order = await prisma.marketOrder.findFirst({
-    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
-  });
+  const { order } = await findSellerOrder(req.user!.id, param(req, "id"));
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const payload = await orderDocumentsForSeller(req.user!.id, order.id);
   return ok(res, serialize(payload));
 });
 
 marketRouter.post("/seller/orders/:id/documents", requireAuth, requireSellerKyb, async (req, res) => {
-  const store = await sellerStoreFor(req.user!.id);
-  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
   const body = z.object({ kind: z.string(), name: z.string(), url: z.string().min(4) }).safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid document");
-  const order = await prisma.marketOrder.findFirst({
-    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
-  });
+  const { order } = await findSellerOrder(req.user!.id, param(req, "id"));
   if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
   const meta = await sellerMeta(req.user!.id);
   const all = { ...((meta.orderDocs as Record<string, unknown[]>) ?? {}) };
@@ -644,13 +669,10 @@ marketRouter.post("/seller/orders/:id/documents", requireAuth, requireSellerKyb,
 });
 
 marketRouter.post("/seller/orders/:id/documents/send", requireAuth, requireSellerKyb, async (req, res) => {
-  const store = await sellerStoreFor(req.user!.id);
-  if (!store) return fail(res, 404, "NOT_FOUND", "Order not found");
-  const order = await prisma.marketOrder.findFirst({
-    where: { id: param(req, "id"), OR: [{ supplier: store.id }, { supplier: store.name }] },
-    include: { user: { select: { id: true, name: true } } },
+  const { store, order } = await findSellerOrder(req.user!.id, param(req, "id"), {
+    user: { select: { id: true, name: true } },
   });
-  if (!order) return fail(res, 404, "NOT_FOUND", "Order not found");
+  if (!store || !order) return fail(res, 404, "NOT_FOUND", "Order not found");
 
   const { documents } = await orderDocumentsForSeller(req.user!.id, order.id);
   const uploadedKinds = new Set(documents.map((d) => d.kind));
