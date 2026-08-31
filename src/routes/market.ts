@@ -39,6 +39,15 @@ function validationMessage(error: z.ZodError, fallback = "Invalid product") {
   return `${path}: ${issue.message}`;
 }
 
+function isVideoMediaUrl(url: string) {
+  return /\.(mp4|mov|m4v|webm)(\?|$)/i.test(url);
+}
+
+function firstImageMediaUrl(urls: string[] | undefined, fallback?: string | null) {
+  if (!urls?.length) return fallback ?? null;
+  return urls.find((u) => u && !isVideoMediaUrl(u)) ?? urls[0] ?? fallback ?? null;
+}
+
 const productShippingSchema = {
   cbmPerUnit: z.number().positive().optional(),
   weightKgPerUnit: z.number().positive().optional(),
@@ -299,7 +308,7 @@ marketRouter.post("/seller/products", requireAuth, async (req, res) => {
         description: body.data.description,
         priceMinor: BigInt(body.data.priceMinor),
         currency: body.data.currency,
-        imageUrl: body.data.imageUrl ?? body.data.mediaUrls?.[0] ?? null,
+        imageUrl: body.data.imageUrl ?? firstImageMediaUrl(body.data.mediaUrls) ?? null,
         moq: body.data.moq ?? "1 unit",
         categoryId: body.data.categoryId ?? null,
         active,
