@@ -76,3 +76,86 @@ export async function syncFxTableToFeeConfig() {
     });
   }
 }
+
+/** Primary admin desk pairs (display order). */
+export const ADMIN_FX_DISPLAY_PAIRS: {
+  pair: string;
+  rate: number;
+  spreadBps: number;
+  source: "Wise" | "CBN" | "Manual" | "Alipay";
+}[] = [
+  { pair: "CNY_NGN", rate: 229.04, spreadBps: 180, source: "Wise" },
+  { pair: "USD_NGN", rate: 1620, spreadBps: 120, source: "CBN" },
+  { pair: "CNY_USD", rate: 0.1413, spreadBps: 40, source: "Wise" },
+  { pair: "GHS_NGN", rate: 108.42, spreadBps: 250, source: "Manual" },
+  { pair: "KES_NGN", rate: 12.41, spreadBps: 200, source: "Manual" },
+  { pair: "USD_CNY", rate: 7.078, spreadBps: 40, source: "Wise" },
+];
+
+export function pairToDisplay(pair: string) {
+  return pair.replace("_", "/");
+}
+
+export function spreadPctFromBps(bps: number) {
+  return bps / 100;
+}
+
+export function buySellFromMid(mid: number, spreadBps: number) {
+  const half = mid * (spreadBps / 10_000 / 2);
+  return { buy: mid - half, sell: mid + half };
+}
+
+export async function ensureAdminFxDisplayPairs() {
+  for (const row of ADMIN_FX_DISPLAY_PAIRS) {
+    await prisma.fxRate.upsert({
+      where: { pair: row.pair },
+      create: { pair: row.pair, rate: row.rate, spreadBps: row.spreadBps },
+      update: {},
+    });
+    await prisma.feeConfig.upsert({
+      where: { key: `fx.${row.pair}` },
+      create: { key: `fx.${row.pair}`, value: rateToFeeConfigValue(row.rate) },
+      update: {},
+    });
+    if (row.source === "Manual") {
+      await prisma.feeConfig.upsert({
+        where: { key: `fx.manual.${row.pair}` },
+        create: { key: `fx.manual.${row.pair}`, value: 1 },
+        update: {},
+      });
+    }
+  }
+}
+
+export async function listAdminFxPairs() {
+  await ensureDefaultFxFeeConfig();
+  await ensureAdminFxDisplayPairs();
+
+  const order = ADMIN_FX_DISPLAY_PAIRS.map((p) => p.pair);
+  const rates = await prisma.fxRate.findMany({ where: { pair: { in: order } } });
+  const manualRows = await prisma.feeConfig.findMany({ where: { key: { startsWith: "fx.manual." } } });
+  const manualSet = new Set(
+    manualRows.filter((r) => r.value === 1).map((r) => r.key.replace(/^fx\.manual\./i, "")),
+  );
+  const sourceByPair = Object.fromEntries(ADMIN_FX_DISPLAY_PAIRS.map((p) => [p.pair, p.source]));
+
+  const byPair = new Map(rates.map((r) => [r.pair, r]));
+  return order.map((pairKey) => {
+    const row = byPair.get(pairKey);
+    const mid = row ? Number(row.rate) : 0;
+    const spreadBps = row?.spreadBps ?? 50;
+    const override = manualSet.has(pairKey);
+    const { buy, sell } = buySellFromMid(mid, spreadBps);
+    return {
+      pair: pairToDisplay(pairKey),
+      pairKey,
+      mid,
+      buy,
+      sell,
+      spreadPct: spreadPctFromBps(spreadBps),
+      source: override ? "Manual" : (sourceByPair[pairKey] ?? "Wise"),
+      override,
+      updatedAt: row?.updatedAt?.toISOString() ?? new Date().toISOString(),
+    };
+  });
+}

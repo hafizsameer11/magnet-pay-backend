@@ -4,7 +4,7 @@ import { activatePendingSellerProducts } from "../services/seller-kyb.js";
 import {fail, ok, requireAuth, requireAdmin, serialize, param } from "../lib/http.js";
 import { z } from "zod";
 import { mpEmail, notifyConversationPeers, notifyUser, notifyUsers } from "../services/user-notify.js";
-import { formatMoney } from "../services/ledger.js";
+import { formatMoney, recordTx, settleEscrowRelease } from "../services/ledger.js";
 import { getConversationContext, upsertChatQuote } from "../services/chat-quote.js";
 import {
   attachForConversation,
@@ -15,6 +15,8 @@ import { translateChatText } from "../services/chat-translate.js";
 import {
   ensureDefaultFxFeeConfig,
   feeConfigKeyToPair,
+  listAdminFxPairs,
+  rateToFeeConfigValue,
   syncFeeConfigRatesToFxTable,
   syncFxTableToFeeConfig,
 } from "../services/fx-rates-sync.js";
@@ -1048,12 +1050,45 @@ adminRouter.get("/orders/:id", async (req, res) => {
   const row = await prisma.marketOrder.findUnique({
     where: { id: param(req, "id") },
     include: {
-      items: { include: { product: true } },
+      items: {
+        include: {
+          product: {
+            include: {
+              store: { select: { id: true, name: true } },
+              category: { select: { name: true } },
+              brand: { select: { name: true } },
+            },
+          },
+        },
+      },
       user: { select: userSelect },
+      shipment: true,
+      _count: { select: { notes: true } },
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Order not found");
-  return ok(res, serialize(row));
+
+  const escrow = row.escrowId
+    ? await prisma.escrow.findUnique({
+        where: { id: row.escrowId },
+        include: { seller: { select: { id: true, name: true } } },
+      })
+    : null;
+
+  const [fxRow, feeRow] = await Promise.all([
+    prisma.fxRate.findUnique({ where: { pair: "CNY_NGN" } }),
+    prisma.feeConfig.findUnique({ where: { key: "escrow_fee_bps" } }),
+  ]);
+
+  return ok(
+    res,
+    serialize({
+      ...row,
+      escrow,
+      fxCnyNgn: fxRow ? Number(fxRow.rate) : 229.04,
+      platformFeeBps: feeRow?.value ?? 250,
+    }),
+  );
 });
 
 adminRouter.post("/orders/:id/cancel", async (req, res) => {
@@ -1501,7 +1536,110 @@ adminRouter.get("/escrows/:id", async (req, res) => {
     },
   });
   if (!row) return fail(res, 404, "NOT_FOUND", "Escrow not found");
-  return ok(res, serialize(row));
+
+  const order = await prisma.marketOrder.findFirst({
+    where: { escrowId: row.id },
+    include: {
+      items: {
+        include: {
+          product: { select: { id: true, title: true, imageUrl: true } },
+        },
+      },
+    },
+  });
+
+  const fxRow = await prisma.fxRate.findUnique({ where: { pair: "CNY_NGN" } });
+
+  return ok(
+    res,
+    serialize({
+      ...row,
+      order,
+      fxCnyNgn: fxRow ? Number(fxRow.rate) : 229.04,
+    }),
+  );
+});
+
+adminRouter.post("/escrows/:id/milestones/:msId/release", async (req, res) => {
+  const escrow = await prisma.escrow.findUnique({
+    where: { id: param(req, "id") },
+    include: { milestones: true },
+  });
+  if (!escrow?.sellerId) return fail(res, 404, "NOT_FOUND", "Escrow not found");
+  const msId = param(req, "msId");
+  const ms = escrow.milestones.find((m) => m.id === msId);
+  if (!ms || ms.status === "RELEASED" || ms.status === "DISPUTED") {
+    return fail(res, 400, "BAD_STATE", "Milestone not releasable");
+  }
+
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      if (ms.status === "PENDING") {
+        await tx.escrowMilestone.update({ where: { id: ms.id }, data: { status: "FUNDED" } });
+      }
+      await settleEscrowRelease(
+        tx,
+        escrow.buyerId,
+        escrow.sellerId!,
+        escrow.currency,
+        ms.amountMinor,
+        `Admin release ${ms.label}`,
+        ms.id,
+      );
+      await tx.escrowMilestone.update({ where: { id: ms.id }, data: { status: "RELEASED" } });
+      const remaining = await tx.escrowMilestone.count({
+        where: { escrowId: escrow.id, status: { not: "RELEASED" } },
+      });
+      await recordTx(tx, {
+        userId: escrow.sellerId!,
+        kind: "escrow_release",
+        title: escrow.title,
+        subtitle: ms.label,
+        currency: escrow.currency,
+        amountDisplay: `+${formatMoney(escrow.currency, ms.amountMinor)}`,
+        amountPositive: true,
+        icon: "shield-check",
+      });
+      return tx.escrow.update({
+        where: { id: escrow.id },
+        data: {
+          status: remaining === 0 ? "COMPLETED" : "ACTIVE",
+          progress: remaining === 0 ? 1 : 0.75,
+        },
+        include: { milestones: { orderBy: { sortOrder: "asc" } } },
+      });
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actorId: req.user!.id,
+        action: "escrow.milestone.release",
+        entity: "EscrowMilestone",
+        entityId: msId,
+        meta: { escrowId: escrow.id, label: ms.label },
+      },
+    });
+
+    if (updated.status === "COMPLETED") {
+      await prisma.marketOrder.updateMany({
+        where: { escrowId: escrow.id, status: { in: ["IN_ESCROW", "SHIPPED", "DELIVERED"] } },
+        data: { status: "COMPLETED" },
+      });
+    }
+
+    notifyUsers([escrow.buyerId, escrow.sellerId!], {
+      title: updated.status === "COMPLETED" ? "Escrow completed" : "Milestone released",
+      body: `${ms.label} was released by MagnetPay ops.`,
+      href: `/escrow/${escrow.id}`,
+      emailPref: "emailEscrow",
+      emailSubject: "Escrow milestone released",
+      emailText: mpEmail(null, [`Milestone "${ms.label}" on escrow "${escrow.title}" was released by admin.`]),
+    });
+
+    return ok(res, serialize(updated));
+  } catch (e) {
+    return fail(res, 400, "RELEASE_FAILED", e instanceof Error ? e.message : "Release failed");
+  }
 });
 
 adminRouter.get("/inspections", async (req, res) => {
@@ -1652,6 +1790,104 @@ adminRouter.get("/fx/rates", async (_req, res) => {
     });
   }
   return ok(res, serialize(rows));
+});
+
+adminRouter.get("/fx/pairs", async (_req, res) => {
+  const pairs = await listAdminFxPairs();
+  const halted = await prisma.feeConfig.findUnique({ where: { key: "fx.halted" } });
+  return ok(res, serialize({ pairs, halted: halted?.value === 1 }));
+});
+
+adminRouter.post("/fx/refresh", async (req, res) => {
+  const synced = await syncFeeConfigRatesToFxTable();
+  await prisma.fxRate.updateMany({ data: { updatedAt: new Date() } });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "fx.refresh",
+      entity: "FxRate",
+      meta: { synced },
+    },
+  });
+  const pairs = await listAdminFxPairs();
+  return ok(res, serialize({ pairs, synced }));
+});
+
+adminRouter.patch("/fx/pairs/:pairKey", async (req, res) => {
+  const pairKey = param(req, "pairKey").toUpperCase().replace(/\//g, "_");
+  const body = z
+    .object({
+      mid: z.number().positive().optional(),
+      spreadBps: z.number().int().min(0).max(1000).optional(),
+      override: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid pair update");
+
+  const existing = await prisma.fxRate.findUnique({ where: { pair: pairKey } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "FX pair not found");
+
+  if (body.data.mid !== undefined) {
+    await prisma.fxRate.update({
+      where: { pair: pairKey },
+      data: { rate: body.data.mid },
+    });
+    await prisma.feeConfig.upsert({
+      where: { key: `fx.${pairKey}` },
+      create: { key: `fx.${pairKey}`, value: rateToFeeConfigValue(body.data.mid) },
+      update: { value: rateToFeeConfigValue(body.data.mid) },
+    });
+  }
+  if (body.data.spreadBps !== undefined) {
+    await prisma.fxRate.update({
+      where: { pair: pairKey },
+      data: { spreadBps: body.data.spreadBps },
+    });
+  }
+  if (body.data.override !== undefined) {
+    const manualKey = `fx.manual.${pairKey}`;
+    if (body.data.override) {
+      await prisma.feeConfig.upsert({
+        where: { key: manualKey },
+        create: { key: manualKey, value: 1 },
+        update: { value: 1 },
+      });
+    } else {
+      await prisma.feeConfig.deleteMany({ where: { key: manualKey } });
+    }
+  }
+
+  await syncFeeConfigRatesToFxTable();
+  const pairs = await listAdminFxPairs();
+  const updated = pairs.find((p) => p.pairKey === pairKey);
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: "fx.pair.update",
+      entity: "FxRate",
+      meta: { pairKey, ...body.data },
+    },
+  });
+  return ok(res, serialize(updated ?? null));
+});
+
+adminRouter.post("/fx/halt", async (req, res) => {
+  const body = z.object({ halted: z.boolean() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "halted boolean required");
+  await prisma.feeConfig.upsert({
+    where: { key: "fx.halted" },
+    create: { key: "fx.halted", value: body.data.halted ? 1 : 0 },
+    update: { value: body.data.halted ? 1 : 0 },
+  });
+  await prisma.auditLog.create({
+    data: {
+      actorId: req.user!.id,
+      action: body.data.halted ? "fx.halt" : "fx.resume",
+      entity: "FeeConfig",
+      meta: { halted: body.data.halted },
+    },
+  });
+  return ok(res, serialize({ halted: body.data.halted }));
 });
 
 adminRouter.put("/fx/rates", async (req, res) => {
