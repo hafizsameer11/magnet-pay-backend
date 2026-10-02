@@ -12,6 +12,7 @@ import {
   param,
   signAccess,
   signRefresh,
+  verifyAccess,
   type AuthUser,
 } from "../lib/http.js";
 import { verifyTillPasscode, setPasscode, isWeakPasscode } from "../services/merchant-auth.js";
@@ -30,6 +31,7 @@ import {
 import { listBillers, verifyBill, payBill } from "../services/merchant-bills.js";
 import { listAgents } from "../services/merchant-directory.js";
 import { stubNameCheck } from "../services/merchant-name-check.js";
+import { ensureSystemAccounts, ensureUserLedgerAccounts } from "../services/ledger.js";
 
 export const merchantRouter = Router();
 export const agentsRouter = Router();
@@ -206,7 +208,40 @@ merchantRouter.post("/auth/reset", async (req, res) => {
   return fail(res, 400, "VALIDATION", "Unknown step");
 });
 
-merchantRouter.post("/onboard", requireAuth, async (req, res) => {
+function tryAuthUser(req: Request): AuthUser | null {
+  const header = req.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return null;
+  try {
+    return verifyAccess(header.slice(7));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMerchantPhone(phone: string) {
+  return phone.replace(/\s+/g, "").trim();
+}
+
+async function issueMerchantSession(user: { id: string; role: string; platformRole: string }) {
+  const authUser: AuthUser = {
+    id: user.id,
+    role: user.role,
+    platformRole: user.platformRole,
+  };
+  const accessToken = signAccess(authUser);
+  const refreshToken = signRefresh(authUser);
+  const refreshTokenHash = createHash("sha256").update(refreshToken).digest("hex");
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      refreshTokenHash,
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    },
+  });
+  return { accessToken, refreshToken, authUser };
+}
+
+merchantRouter.post("/onboard", async (req, res) => {
   const body = z
     .object({
       businessName: z.string().min(2),
@@ -228,9 +263,58 @@ merchantRouter.post("/onboard", requireAuth, async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid onboard payload");
+
+  const phone = normalizeMerchantPhone(body.data.phone);
+  if (phone.length < 8) return fail(res, 400, "VALIDATION", "Valid phone required");
+
   try {
-    const merchant = await createOnboard({ userId: req.user!.id, ...body.data });
-    return ok(res, serialize(merchant), 201);
+    let userId = tryAuthUser(req)?.id;
+    if (!userId) {
+      let user = await prisma.user.findUnique({ where: { phone } });
+      if (!user) {
+        user = await prisma.user.create({
+          data: {
+            phone,
+            name: body.data.ownerName,
+            role: "MERCHANT",
+            onboardingDone: true,
+          },
+        });
+        for (const currency of ["NGN", "CNY", "USD"] as const) {
+          await prisma.wallet.create({ data: { userId: user.id, currency, balanceMinor: 0n } });
+          await prisma.$transaction(async (tx) => {
+            await ensureSystemAccounts(tx, currency);
+            await ensureUserLedgerAccounts(tx, user!.id, currency);
+          });
+        }
+      } else if (await prisma.merchant.findUnique({ where: { userId: user.id } })) {
+        return fail(res, 400, "ONBOARD_FAILED", "Merchant profile already exists for this phone");
+      }
+      userId = user.id;
+    }
+
+    const merchant = await createOnboard({ userId, ...body.data, phone });
+    const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+    const session = await issueMerchantSession(user);
+
+    return ok(
+      res,
+      {
+        ...serialize(merchant),
+        accessToken: session.accessToken,
+        refreshToken: session.refreshToken,
+        user: serialize({
+          id: user.id,
+          phone: user.phone,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          platformRole: user.platformRole,
+          onboardingDone: user.onboardingDone,
+        }),
+      },
+      201,
+    );
   } catch (e) {
     return fail(res, 400, "ONBOARD_FAILED", e instanceof Error ? e.message : "Onboard failed");
   }
@@ -625,7 +709,8 @@ merchantRouter.post("/bills/pay", requireMerchant, async (req, res) => {
   }
 });
 
-merchantRouter.post("/name-check", requireMerchant, async (req, res) => {
+/** Stub enquiry — public so merchant onboard can verify BVN/account before a session exists. */
+merchantRouter.post("/name-check", async (req, res) => {
   const body = z
     .object({
       kind: z.enum(["phone", "meter", "smartcard", "account", "wallet", "bvn"]),
