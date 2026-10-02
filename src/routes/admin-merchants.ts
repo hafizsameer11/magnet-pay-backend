@@ -308,6 +308,71 @@ adminMerchantsRouter.post("/merchants/disputes", async (req, res) => {
   return ok(res, serialize(row), 201);
 });
 
+adminMerchantsRouter.patch("/merchants/disputes/:id", async (req, res) => {
+  const id = param(req, "id");
+  const body = z
+    .object({
+      status: z.enum(["open", "assigned", "resolved", "closed"]).optional(),
+      assigneeId: z.string().optional().nullable(),
+      note: z.string().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "Invalid dispute update");
+  const existing = await prisma.merchantDispute.findUnique({ where: { id } });
+  if (!existing) return fail(res, 404, "NOT_FOUND", "Dispute not found");
+  const row = await prisma.merchantDispute.update({
+    where: { id },
+    data: {
+      status: body.data.status ?? existing.status,
+      assigneeId: body.data.assigneeId === undefined ? existing.assigneeId : body.data.assigneeId,
+    },
+  });
+  await audit(req.user?.id, "merchant.dispute.update", "MerchantDispute", id, body.data);
+  return ok(res, serialize(row));
+});
+
+adminMerchantsRouter.get("/merchants/:id/notes", async (req, res) => {
+  const id = param(req, "id");
+  const rows = await prisma.auditLog.findMany({
+    where: { entity: "Merchant", entityId: id, action: "merchant.note.add" },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
+  return ok(res, serialize(rows));
+});
+
+adminMerchantsRouter.post("/merchants/:id/notes", async (req, res) => {
+  const id = param(req, "id");
+  const body = z.object({ note: z.string().min(1) }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "note required");
+  const merchant = await prisma.merchant.findUnique({ where: { id } });
+  if (!merchant) return fail(res, 404, "NOT_FOUND", "Merchant not found");
+  await audit(req.user?.id, "merchant.note.add", "Merchant", id, { note: body.data.note });
+  return ok(res, { ok: true }, 201);
+});
+
+adminMerchantsRouter.post("/merchants/:id/logout-sessions", async (req, res) => {
+  const id = param(req, "id");
+  const merchant = await prisma.merchant.findUnique({ where: { id } });
+  if (!merchant) return fail(res, 404, "NOT_FOUND", "Merchant not found");
+  const result = await prisma.session.deleteMany({ where: { userId: merchant.userId } });
+  await audit(req.user?.id, "merchant.sessions.logout", "Merchant", id, { count: result.count });
+  return ok(res, { ok: true, cleared: result.count });
+});
+
+adminMerchantsRouter.post("/merchants/:id/force-passcode-reset", async (req, res) => {
+  const id = param(req, "id");
+  const merchant = await prisma.merchant.findUnique({ where: { id } });
+  if (!merchant) return fail(res, 404, "NOT_FOUND", "Merchant not found");
+  await prisma.merchant.update({
+    where: { id },
+    data: { passcodeHash: null, passcodeFailCount: 0, lockedUntil: null },
+  });
+  await prisma.session.deleteMany({ where: { userId: merchant.userId } });
+  await audit(req.user?.id, "merchant.passcode.force_reset", "Merchant", id);
+  return ok(res, { ok: true });
+});
+
 // ── Settlements ─────────────────────────────────────────────────────────────
 adminMerchantsRouter.get("/merchants/settlements", async (req, res) => {
   const status = typeof req.query.status === "string" ? req.query.status : undefined;

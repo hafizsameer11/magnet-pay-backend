@@ -713,12 +713,45 @@ merchantRouter.post("/bills/pay", requireMerchant, async (req, res) => {
 merchantRouter.post("/name-check", async (req, res) => {
   const body = z
     .object({
-      kind: z.enum(["phone", "meter", "smartcard", "account", "wallet", "bvn"]),
+      kind: z.enum(["phone", "meter", "smartcard", "account", "wallet", "bvn", "nin"]),
       value: z.string().min(1),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "kind and value required");
   return ok(res, stubNameCheck(body.data.kind, body.data.value));
+});
+
+merchantRouter.get("/fees", requireMerchant, async (_req, res) => {
+  const rules = await prisma.merchantFeeRule.findMany({ orderBy: { service: "asc" } });
+  return ok(res, serialize(rules));
+});
+
+merchantRouter.post("/disputes", requireMerchant, async (req, res) => {
+  const m = (req as MerchantRequest).merchant!;
+  const body = z
+    .object({
+      txRef: z.string().min(3),
+      reason: z.string().min(3),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "txRef and reason required");
+  const tx = await prisma.merchantTransaction.findFirst({
+    where: { merchantId: m.id, ref: body.data.txRef },
+  });
+  if (!tx) return fail(res, 404, "NOT_FOUND", "Transaction not found");
+  const row = await prisma.merchantDispute.create({
+    data: {
+      merchantId: m.id,
+      txRef: body.data.txRef,
+      reason: body.data.reason,
+      status: "open",
+    },
+  });
+  await prisma.merchantTransaction.update({
+    where: { ref: body.data.txRef },
+    data: { status: "DISPUTED" },
+  });
+  return ok(res, serialize(row), 201);
 });
 
 merchantRouter.get("/tiers", requireMerchant, async (_req, res) => {

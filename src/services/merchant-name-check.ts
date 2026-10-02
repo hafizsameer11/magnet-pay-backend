@@ -47,6 +47,11 @@ export function stubNameCheck(kind: NameCheckKind, value: string): NameCheckResu
         return { ok: false, message: "BVN must be 11 digits" };
       }
       return { ok: true, name: "IKEJA UNION" };
+    case "nin":
+      if (digits.length !== 11) {
+        return { ok: false, message: "NIN must be 11 digits" };
+      }
+      return { ok: true, name: "IKEJA UNION" };
     default:
       if (v.length < 4) {
         return { ok: false, message: "Value too short" };
