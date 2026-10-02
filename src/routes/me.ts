@@ -30,7 +30,7 @@ meRouter.patch("/", requireAuth, async (req, res) => {
     .object({
       name: z.string().optional(),
       email: z.string().email().optional().nullable(),
-      role: z.enum(["BUYER", "SELLER", "BOTH"]).optional(),
+      role: z.enum(["BUYER", "SELLER", "BOTH", "MERCHANT"]).optional(),
       avatarUrl: z.string().url().optional().nullable(),
       dateOfBirth: z
         .string()

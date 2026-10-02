@@ -11,6 +11,7 @@ enum UserRole {
   BUYER
   SELLER
   BOTH
+  MERCHANT
 }
 
 enum PlatformRole {
@@ -216,6 +217,10 @@ model User {
   providerEvents  ProviderEvent[]
   fxConversions   FxConversion[]
   transactions    Transaction[]
+  merchant        Merchant?
+  floatAdjustmentsRequested FloatAdjustment[] @relation("FloatAdjustRequester")
+  floatAdjustmentsApproved  FloatAdjustment[] @relation("FloatAdjustApprover")
+  merchantDocReviews MerchantDocument[] @relation("MerchantDocReviewer")
 }
 
 model Session {
@@ -1274,4 +1279,345 @@ model AdminRecord {
 
   @@index([domain])
   @@index([domain, status])
+}
+
+// ─── Merchant (Agent Network) ───────────────────────────────────────────────
+
+enum MerchantStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum MerchantBusinessType {
+  REGISTERED
+  UNREGISTERED
+}
+
+enum MerchantTier {
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+enum MerchantDocKind {
+  CAC
+  GOV_ID
+  SHOP_PHOTO
+  UTILITY
+}
+
+enum MerchantDocStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum MerchantTxKind {
+  CASH_IN
+  CASH_OUT
+  BILL
+  TRANSFER
+}
+
+enum MerchantTxStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+  DISPUTED
+}
+
+enum BillerCategory {
+  AIRTIME
+  DATA
+  POWER
+  CABLE
+}
+
+enum SettlementStatus {
+  QUEUED
+  PAID
+  FAILED
+  HELD
+}
+
+enum BankChangeStatus {
+  PENDING
+  APPROVED
+  DENIED
+  EXPIRED
+}
+
+enum FloatAdjustStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+model Merchant {
+  id                   String               @id @default(uuid())
+  userId               String               @unique
+  agentId              String               @unique
+  tag                  String               @unique
+  businessName         String
+  businessType         MerchantBusinessType @default(REGISTERED)
+  category             String               @default("General")
+  address              String               @default("")
+  state                String               @default("Lagos")
+  lga                  String               @default("Ikeja")
+  lat                  Float?
+  lng                  Float?
+  phone                String
+  ownerName            String               @default("")
+  bvnLast4             String?
+  bvnVerified          Boolean              @default(false)
+  ninVerified          Boolean              @default(false)
+  status               MerchantStatus       @default(PENDING)
+  tier                 MerchantTier         @default(SILVER)
+  dailyLimit           Int                  @default(30000000) // kobo / minor NGN (₦300,000)
+  premiumPartner       Boolean              @default(false)
+  listedInDirectory    Boolean              @default(true)
+  settlementBank       String?
+  settlementAccount    String?
+  settlementAccountName String?
+  vaBank               String               @default("Wema Bank")
+  vaAccountNumber      String?
+  passcodeHash         String?
+  passcodeFailCount    Int                  @default(0)
+  lockedUntil          DateTime?
+  unpaidEarningsMinor  BigInt               @default(0)
+  openHours            Json?
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  user                 User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents            MerchantDocument[]
+  float                MerchantFloat?
+  transactions         MerchantTransaction[]
+  settlements          MerchantSettlement[]
+  bankChanges          SettlementBankChange[]
+  floatAdjustments     FloatAdjustment[]
+  disputes             MerchantDispute[]
+  referralsGiven       MerchantReferral[]   @relation("Referrer")
+  referralsReceived    MerchantReferral[]   @relation("Referred")
+  staff                MerchantStaff[]
+  branches             MerchantBranch[]
+
+  @@index([status])
+  @@index([state, lga])
+  @@index([tier])
+}
+
+model MerchantDocument {
+  id           String            @id @default(uuid())
+  merchantId   String
+  kind         MerchantDocKind
+  fileUrl      String
+  status       MerchantDocStatus @default(PENDING)
+  rejectReason String?
+  reviewedById String?
+  reviewedAt   DateTime?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  merchant     Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  reviewedBy   User?             @relation("MerchantDocReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+
+  @@index([merchantId, status])
+}
+
+model MerchantFloat {
+  id           String   @id @default(uuid())
+  merchantId   String   @unique
+  cashMinor    BigInt   @default(0)
+  digitalMinor BigInt   @default(0)
+  updatedAt    DateTime @updatedAt
+  merchant     Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+}
+
+model MerchantTransaction {
+  id                 String           @id @default(uuid())
+  ref                String           @unique
+  merchantId         String
+  kind               MerchantTxKind
+  amountMinor        BigInt
+  platformFeeMinor   BigInt           @default(0)
+  agentFeeMinor      BigInt           @default(0)
+  customerTotalMinor BigInt           @default(0)
+  counterparty       String?
+  counterpartyName   String?
+  billerId           String?
+  billAccount        String?
+  token              String?
+  status             MerchantTxStatus @default(PENDING)
+  meta               Json?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  merchant           Merchant         @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  biller             Biller?          @relation(fields: [billerId], references: [id], onDelete: SetNull)
+  disputes           MerchantDispute[]
+
+  @@index([merchantId, createdAt])
+  @@index([status])
+  @@index([kind])
+}
+
+model MerchantSettlement {
+  id            String           @id @default(uuid())
+  merchantId    String
+  amountMinor   BigInt
+  bank          String
+  accountLast4  String
+  batchDate     DateTime         @db.Date
+  status        SettlementStatus @default(QUEUED)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  merchant      Merchant         @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId, batchDate])
+  @@index([status])
+}
+
+model SettlementBankChange {
+  id           String           @id @default(uuid())
+  merchantId   String
+  oldBank      String?
+  oldAccount   String?
+  newBank      String
+  newAccount   String
+  newAccountName String?
+  status       BankChangeStatus @default(PENDING)
+  pauseUntil   DateTime
+  requestedAt  DateTime         @default(now())
+  decidedAt    DateTime?
+  merchant     Merchant         @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId, status])
+}
+
+model FloatAdjustment {
+  id           String            @id @default(uuid())
+  merchantId   String
+  amountMinor  BigInt
+  reason       String
+  status       FloatAdjustStatus @default(PENDING)
+  requestedById String
+  approvedById String?
+  createdAt    DateTime          @default(now())
+  decidedAt    DateTime?
+  merchant     Merchant          @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  requestedBy  User              @relation("FloatAdjustRequester", fields: [requestedById], references: [id])
+  approvedBy   User?             @relation("FloatAdjustApprover", fields: [approvedById], references: [id])
+
+  @@index([merchantId, status])
+}
+
+model MerchantFeeRule {
+  id           String   @id @default(uuid())
+  service      String
+  minAmount    Int      @default(0)
+  maxAmount    Int?
+  feeType      String
+  value        Int
+  tier         String?
+  effectiveFrom DateTime @default(now())
+  version      Int      @default(1)
+  createdAt    DateTime @default(now())
+
+  @@index([service, effectiveFrom])
+}
+
+model MerchantTierRule {
+  id                      String      @id @default(uuid())
+  tier                    MerchantTier @unique
+  monthlyVolumeThreshold  BigInt      @default(0)
+  dailyLimitMinor         Int
+  singleLimitMinor        Int
+  createdAt               DateTime    @default(now())
+  updatedAt               DateTime    @updatedAt
+}
+
+model Biller {
+  id          String         @id @default(uuid())
+  category    BillerCategory
+  name        String
+  logoUrl     String?
+  brandColor  String         @default("#0E3B2E")
+  enabled     Boolean        @default(true)
+  sort        Int            @default(0)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  plans       BillerPlan[]
+  transactions MerchantTransaction[]
+
+  @@index([category, enabled])
+  @@unique([category, name])
+}
+
+model BillerPlan {
+  id          String @id @default(uuid())
+  billerId    String
+  name        String
+  priceMinor  Int
+  sort        Int    @default(0)
+  biller      Biller @relation(fields: [billerId], references: [id], onDelete: Cascade)
+
+  @@index([billerId])
+}
+
+model MerchantDispute {
+  id         String   @id @default(uuid())
+  txRef      String?
+  merchantId String
+  reason     String
+  status     String   @default("open")
+  assigneeId String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  merchant   Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  transaction MerchantTransaction? @relation(fields: [txRef], references: [ref], onDelete: SetNull)
+
+  @@index([merchantId, status])
+}
+
+model MerchantReferral {
+  id           String   @id @default(uuid())
+  referrerId   String
+  referredId   String
+  rewardMinor  BigInt   @default(0)
+  status       String   @default("pending")
+  createdAt    DateTime @default(now())
+  referrer     Merchant @relation("Referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referred     Merchant @relation("Referred", fields: [referredId], references: [id], onDelete: Cascade)
+
+  @@unique([referrerId, referredId])
+}
+
+model MerchantStaff {
+  id           String   @id @default(uuid())
+  merchantId   String
+  name         String
+  phone        String
+  role         String   @default("cashier")
+  permissions  Json?
+  passcodeHash String?
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  merchant     Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId])
+}
+
+model MerchantBranch {
+  id           String   @id @default(uuid())
+  merchantId   String
+  name         String
+  address      String   @default("")
+  cashMinor    BigInt   @default(0)
+  digitalMinor BigInt   @default(0)
+  createdAt    DateTime @default(now())
+  merchant     Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+
+  @@index([merchantId])
 }

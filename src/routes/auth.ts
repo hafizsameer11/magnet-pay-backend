@@ -120,7 +120,7 @@ authRouter.post("/otp/verify", async (req, res) => {
       phone: z.string(),
       code: z.string().length(6),
       email: z.string().email().optional(),
-      role: z.enum(["BUYER", "SELLER"]).optional(),
+      role: z.enum(["BUYER", "SELLER", "MERCHANT"]).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit code required");
@@ -160,7 +160,7 @@ authRouter.post("/otp/verify", async (req, res) => {
       });
     }
   } else {
-    const patch: { email?: string; role?: "BUYER" | "SELLER" | "BOTH" } = {};
+    const patch: { email?: string; role?: "BUYER" | "SELLER" | "BOTH" | "MERCHANT" } = {};
     if (!user.email && verifiedEmail) {
       const emailTaken = await prisma.user.findUnique({ where: { email: verifiedEmail } });
       if (emailTaken && emailTaken.id !== user.id) {

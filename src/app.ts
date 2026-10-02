@@ -8,6 +8,8 @@ import { escrowRouter } from "./routes/escrow.js";
 import { logisticsRouter } from "./routes/logistics.js";
 import { marketRouter } from "./routes/market.js";
 import { adminRouter, messagesRouter, notificationsRouter } from "./routes/admin.js";
+import { adminMerchantsRouter } from "./routes/admin-merchants.js";
+import { merchantRouter, agentsRouter } from "./routes/merchant.js";
 import { uploadsRouter } from "./routes/uploads.js";
 import { contentRouter } from "./routes/content.js";
 import path from "node:path";
@@ -55,6 +57,9 @@ export function createApp() {
   app.use("/market", marketRouter);
   app.use("/notifications", notificationsRouter);
   app.use("/messages", messagesRouter);
+  app.use("/merchant", merchantRouter);
+  app.use("/agents", agentsRouter);
+  app.use("/admin", adminMerchantsRouter);
   app.use("/admin", adminRouter);
   app.use("/uploads", uploadsRouter);
   app.use("/content", contentRouter);

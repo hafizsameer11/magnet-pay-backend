@@ -4,6 +4,7 @@ import { PrismaClient } from "@prisma/client";
 import { ensureSystemAccounts, ensureUserLedgerAccounts } from "../src/services/ledger.js";
 import { DEFAULT_COMPLIANCE_LIMITS } from "../src/services/compliance-limits.js";
 import { seedAdminRecords } from "../src/services/admin-records-seed.js";
+import { seedMerchantModule } from "./seed-merchant.js";
 
 const prisma = new PrismaClient();
 
@@ -38,6 +39,22 @@ const IMG = {
 
 async function main() {
   console.log("Seeding MagnetPay with catalog images…");
+
+  await prisma.merchantDispute.deleteMany();
+  await prisma.merchantReferral.deleteMany();
+  await prisma.merchantStaff.deleteMany();
+  await prisma.merchantBranch.deleteMany();
+  await prisma.floatAdjustment.deleteMany();
+  await prisma.settlementBankChange.deleteMany();
+  await prisma.merchantSettlement.deleteMany();
+  await prisma.merchantTransaction.deleteMany();
+  await prisma.billerPlan.deleteMany();
+  await prisma.biller.deleteMany();
+  await prisma.merchantFeeRule.deleteMany();
+  await prisma.merchantTierRule.deleteMany();
+  await prisma.merchantDocument.deleteMany();
+  await prisma.merchantFloat.deleteMany();
+  await prisma.merchant.deleteMany();
 
   await prisma.providerEvent.deleteMany();
   await prisma.auditLog.deleteMany();
@@ -1066,19 +1083,25 @@ async function main() {
 
   await seedAdminRecords();
 
+  const merchantSeed = await seedMerchantModule(prisma, seedAsset);
+
   console.log("Seed complete — rich catalog with app images");
   console.log({
     buyer: { phone: buyer.phone, passcode: "123456", name: buyer.name },
     seller: { phone: seller.phone, passcode: "123456", name: seller.name },
     seller2: { phone: seller2.phone, passcode: "123456", name: seller2.name },
     admin: { phone: admin.phone, passcode: "123456" },
+    merchant: {
+      phone: merchantSeed.merchantUser.phone,
+      passcode: "123456",
+      agentId: merchantSeed.merchant.agentId,
+      tag: merchantSeed.merchant.tag,
+    },
     products: products.length,
     categories: cats.length,
     escrowId: escrow.id,
     shipmentId: shipment.id,
     rfqId: rfq.id,
-    conversationId: convo.id,
-    orderId: order1.id,
   });
 }
 
