@@ -347,6 +347,13 @@ merchantRouter.patch("/me", requireMerchant, async (req, res) => {
       settlementAccountName: z.string().optional(),
       passcode: z.string().length(6).optional(),
       currentPasscode: z.string().length(6).optional(),
+      settings: z
+        .object({
+          alertReadIds: z.array(z.string()).optional(),
+          autoPrint: z.boolean().optional(),
+          biometricEnabled: z.boolean().optional(),
+        })
+        .optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid body");
@@ -383,10 +390,25 @@ merchantRouter.patch("/me", requireMerchant, async (req, res) => {
     });
   }
 
-  const { passcode: _p, currentPasscode: _c, ...rest } = body.data;
+  const { passcode: _p, currentPasscode: _c, settings: settingsPatch, ...rest } = body.data;
+  let nextSettings = m.settings;
+  if (settingsPatch) {
+    const prev =
+      m.settings && typeof m.settings === "object" && !Array.isArray(m.settings)
+        ? (m.settings as Record<string, unknown>)
+        : {};
+    nextSettings = {
+      ...prev,
+      ...settingsPatch,
+      alertReadIds: settingsPatch.alertReadIds ?? (prev.alertReadIds as string[] | undefined) ?? [],
+    };
+  }
   const updated = await prisma.merchant.update({
     where: { id: m.id },
-    data: rest,
+    data: {
+      ...rest,
+      ...(settingsPatch ? { settings: nextSettings as object } : {}),
+    },
   });
   return ok(res, serialize(updated));
 });
@@ -761,6 +783,12 @@ merchantRouter.get("/tiers", requireMerchant, async (_req, res) => {
 
 merchantRouter.get("/alerts", requireMerchant, async (req, res) => {
   const m = (req as MerchantRequest).merchant!;
+  const fresh = await prisma.merchant.findUnique({ where: { id: m.id }, select: { settings: true } });
+  const settings =
+    fresh?.settings && typeof fresh.settings === "object" && !Array.isArray(fresh.settings)
+      ? (fresh.settings as { alertReadIds?: string[] })
+      : {};
+  const readIds = new Set(settings.alertReadIds ?? []);
   const float = await getFloat(m.id);
   const pending = await prisma.merchantTransaction.findMany({
     where: { merchantId: m.id, status: "PENDING" },
@@ -785,50 +813,85 @@ merchantRouter.get("/alerts", requireMerchant, async (req, res) => {
   }[] = [];
 
   if (float.lowCash) {
+    const id = `low-cash-${m.id}`;
     alerts.push({
-      id: `low-cash-${m.id}`,
+      id,
       type: "low_cash",
       title: "Cash on hand is running low",
       subtitle: `₦${(Number(float.cashMinor) / 100).toLocaleString("en-NG")} left — top up float`,
       href: "/merchant/float",
       createdAt: new Date().toISOString(),
-      unread: true,
+      unread: !readIds.has(id),
     });
   }
   for (const tx of pending) {
+    const id = `tx-${tx.ref}`;
     alerts.push({
-      id: `tx-${tx.ref}`,
+      id,
       type: "pending_tx",
       title: `Waiting · ${tx.ref}`,
       subtitle: tx.counterpartyName || tx.counterparty || tx.kind,
       href: `/merchant/tx/${tx.ref}`,
       createdAt: tx.createdAt.toISOString(),
-      unread: true,
+      unread: !readIds.has(id),
     });
   }
   for (const d of docs) {
+    const id = `doc-${d.id}`;
     alerts.push({
-      id: `doc-${d.id}`,
+      id,
       type: "doc_rejected",
       title: "A document needs attention",
       subtitle: d.rejectReason || `${d.kind} was rejected`,
       href: "/merchant/kyb",
       createdAt: d.updatedAt.toISOString(),
-      unread: true,
+      unread: !readIds.has(id),
     });
   }
   for (const s of settlements) {
+    const id = `settle-${s.id}`;
     alerts.push({
-      id: `settle-${s.id}`,
+      id,
       type: "settlement",
       title: "Earnings queued for settlement",
       subtitle: `${s.bank} · ${s.status}`,
       href: "/merchant/earnings",
       createdAt: s.createdAt.toISOString(),
-      unread: false,
+      unread: !readIds.has(id),
     });
   }
   return ok(res, serialize(alerts));
+});
+
+merchantRouter.post("/alerts/read", requireMerchant, async (req, res) => {
+  const m = (req as MerchantRequest).merchant!;
+  const body = z
+    .object({
+      ids: z.array(z.string()).default([]),
+      all: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "ids required");
+
+  const fresh = await prisma.merchant.findUnique({ where: { id: m.id }, select: { settings: true } });
+  const prev =
+    fresh?.settings && typeof fresh.settings === "object" && !Array.isArray(fresh.settings)
+      ? (fresh.settings as Record<string, unknown>)
+      : {};
+  const existing = new Set<string>(Array.isArray(prev.alertReadIds) ? (prev.alertReadIds as string[]) : []);
+  for (const id of body.data.ids) existing.add(id);
+
+  const updated = await prisma.merchant.update({
+    where: { id: m.id },
+    data: {
+      settings: {
+        ...prev,
+        alertReadIds: [...existing],
+      },
+    },
+  });
+  const settings = updated.settings as { alertReadIds?: string[] } | null;
+  return ok(res, { alertReadIds: settings?.alertReadIds ?? [] });
 });
 
 // ── Staff / branches / referrals ────────────────────────────────────────────
@@ -928,12 +991,14 @@ merchantRouter.post("/referrals", requireMerchant, async (req, res) => {
   if (!body.success) return fail(res, 400, "VALIDATION", "referredAgentId required");
   const referred = await prisma.merchant.findUnique({ where: { agentId: body.data.referredAgentId } });
   if (!referred) return fail(res, 404, "NOT_FOUND", "Referred merchant not found");
+  const rewardCfg = await prisma.feeConfig.findUnique({ where: { key: "merchant.referral.rewardMinor" } });
+  const rewardMinor = BigInt(rewardCfg?.value ?? 500000);
   try {
     const row = await prisma.merchantReferral.create({
       data: {
         referrerId: m.id,
         referredId: referred.id,
-        rewardMinor: 500000n,
+        rewardMinor,
         status: "pending",
       },
     });

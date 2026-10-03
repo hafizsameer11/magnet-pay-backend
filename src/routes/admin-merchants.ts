@@ -765,20 +765,22 @@ adminMerchantsRouter.post("/merchants/broadcasts", async (req, res) => {
       tier: z.enum(["SILVER", "GOLD", "PLATINUM"]).optional(),
       state: z.string().optional(),
       status: z.enum(["ACTIVE", "PENDING", "SUSPENDED", "CLOSED"]).optional(),
+      channels: z.array(z.enum(["push", "sms"])).optional(),
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "Invalid broadcast");
 
+  const channels = body.data.channels?.length ? body.data.channels : ["push"];
   const merchants = await prisma.merchant.findMany({
     where: {
       ...(body.data.tier ? { tier: body.data.tier } : {}),
       ...(body.data.state ? { state: body.data.state } : {}),
       ...(body.data.status ? { status: body.data.status } : { status: "ACTIVE" }),
     },
-    select: { userId: true },
+    select: { userId: true, phone: true },
   });
 
-  if (merchants.length) {
+  if (merchants.length && channels.includes("push")) {
     await prisma.notification.createMany({
       data: merchants.map((m) => ({
         userId: m.userId,
@@ -792,8 +794,58 @@ adminMerchantsRouter.post("/merchants/broadcasts", async (req, res) => {
   await audit(req.user?.id, "merchant.broadcast", "Notification", undefined, {
     count: merchants.length,
     title: body.data.title,
+    body: body.data.body,
+    channels,
+    tier: body.data.tier ?? null,
+    state: body.data.state ?? null,
+    smsPhones: channels.includes("sms") ? merchants.map((m) => m.phone) : [],
   });
-  return ok(res, { sent: merchants.length });
+  return ok(res, { sent: merchants.length, channels });
+});
+
+adminMerchantsRouter.get("/merchants/broadcasts", async (_req, res) => {
+  const rows = await prisma.auditLog.findMany({
+    where: { action: "merchant.broadcast" },
+    orderBy: { createdAt: "desc" },
+    take: 50,
+  });
+  return ok(
+    res,
+    serialize(
+      rows.map((r) => {
+        const meta = (r.meta ?? {}) as Record<string, unknown>;
+        return {
+          id: r.id,
+          title: String(meta.title ?? "Broadcast"),
+          body: String(meta.body ?? ""),
+          sent: Number(meta.count ?? 0),
+          channels: Array.isArray(meta.channels) ? meta.channels : ["push"],
+          tier: meta.tier ?? null,
+          state: meta.state ?? null,
+          createdAt: r.createdAt,
+        };
+      }),
+    ),
+  );
+});
+
+adminMerchantsRouter.get("/merchants/referral-config", async (_req, res) => {
+  const row = await prisma.feeConfig.findUnique({ where: { key: "merchant.referral.rewardMinor" } });
+  return ok(res, {
+    rewardMinor: row ? Number(row.value) : 500000,
+  });
+});
+
+adminMerchantsRouter.put("/merchants/referral-config", async (req, res) => {
+  const body = z.object({ rewardMinor: z.number().int().positive() }).safeParse(req.body);
+  if (!body.success) return fail(res, 400, "VALIDATION", "rewardMinor required");
+  const row = await prisma.feeConfig.upsert({
+    where: { key: "merchant.referral.rewardMinor" },
+    create: { key: "merchant.referral.rewardMinor", value: body.data.rewardMinor },
+    update: { value: body.data.rewardMinor },
+  });
+  await audit(req.user?.id, "merchant.referral.config", "FeeConfig", row.id, body.data);
+  return ok(res, { rewardMinor: Number(row.value) });
 });
 
 // ── Reports ─────────────────────────────────────────────────────────────────

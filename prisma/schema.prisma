@@ -1389,6 +1389,7 @@ model Merchant {
   lockedUntil          DateTime?
   unpaidEarningsMinor  BigInt               @default(0)
   openHours            Json?
+  settings             Json?
   createdAt            DateTime             @default(now())
   updatedAt            DateTime             @updatedAt
 
