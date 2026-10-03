@@ -60,21 +60,37 @@ authRouter.get("/signup/availability", async (req, res) => {
 authRouter.post("/otp/request", async (req, res) => {
   const body = z
     .object({
-      phone: z.string().min(8),
+      phone: z.string().min(8).optional(),
       email: z.string().email().optional(),
+      purpose: z.enum(["signup", "reset"]).optional(),
     })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "phone required");
+  if (!body.success) return fail(res, 400, "VALIDATION", "phone or email required");
+  if (!body.data.phone && !body.data.email) {
+    return fail(res, 400, "VALIDATION", "phone or email required");
+  }
 
-  const phone = normalizePhone(body.data.phone);
+  let phone = body.data.phone ? normalizePhone(body.data.phone) : "";
   let email = body.data.email ? normalizeEmail(body.data.email) : "";
+  const purpose = body.data.purpose ?? (email && !body.data.phone ? "reset" : "signup");
 
   if (email && !isValidEmail(email)) {
     return fail(res, 400, "VALIDATION", "Valid email required");
   }
 
-  // Forgot-passcode / existing users: resolve email from account when not provided
-  if (!email) {
+  // Forgot passcode: identify account by email, then send OTP to that email.
+  if (purpose === "reset" || (!phone && email)) {
+    if (!email) {
+      return fail(res, 400, "VALIDATION", "Email is required to reset your passcode");
+    }
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (!existing?.phone) {
+      return fail(res, 404, "NOT_FOUND", "No MagnetPay account found for that email");
+    }
+    phone = normalizePhone(existing.phone);
+    email = normalizeEmail(existing.email || email);
+  } else if (!email) {
+    // Signup/forgot with phone only: resolve email from account when not provided
     const existing = await prisma.user.findUnique({ where: { phone } });
     if (!existing?.email) {
       return fail(
@@ -87,9 +103,9 @@ authRouter.post("/otp/request", async (req, res) => {
     email = normalizeEmail(existing.email);
   }
 
-  // Signup-only: email must not belong to a different phone (forgot-passcode omits email or uses account email)
+  // Signup-only: email must not belong to a different phone
   const emailOwner = await prisma.user.findUnique({ where: { email } });
-  if (emailOwner && emailOwner.phone !== phone) {
+  if (purpose !== "reset" && emailOwner && emailOwner.phone !== phone) {
     return fail(res, 400, "EMAIL_IN_USE", "This email is already registered with another account");
   }
 
@@ -110,6 +126,7 @@ authRouter.post("/otp/request", async (req, res) => {
     email,
     expiresAt,
     channel: "email" as const,
+    purpose,
     ...(exposeDebugCode() ? { debugCode: code } : {}),
   });
 });
@@ -117,22 +134,25 @@ authRouter.post("/otp/request", async (req, res) => {
 authRouter.post("/otp/verify", async (req, res) => {
   const body = z
     .object({
-      phone: z.string(),
+      phone: z.string().optional(),
       code: z.string().length(6),
       email: z.string().email().optional(),
       role: z.enum(["BUYER", "SELLER", "MERCHANT"]).optional(),
     })
     .safeParse(req.body);
-  if (!body.success) return fail(res, 400, "VALIDATION", "phone and 6-digit code required");
+  if (!body.success) return fail(res, 400, "VALIDATION", "code required with phone or email");
+  if (!body.data.phone && !body.data.email) {
+    return fail(res, 400, "VALIDATION", "phone or email required");
+  }
 
-  const phone = normalizePhone(body.data.phone);
-  const email = body.data.email ? normalizeEmail(body.data.email) : undefined;
+  const phoneIn = body.data.phone ? normalizePhone(body.data.phone) : "";
+  const emailIn = body.data.email ? normalizeEmail(body.data.email) : undefined;
 
   const challenge = await prisma.otpChallenge.findFirst({
     where: {
-      phone,
       consumedAt: null,
-      ...(email ? { email } : {}),
+      ...(phoneIn ? { phone: phoneIn } : {}),
+      ...(emailIn ? { email: emailIn } : {}),
     },
     orderBy: { createdAt: "desc" },
   });
@@ -141,9 +161,13 @@ authRouter.post("/otp/verify", async (req, res) => {
   }
   await prisma.otpChallenge.update({ where: { id: challenge.id }, data: { consumedAt: new Date() } });
 
-  const verifiedEmail = email ?? challenge.email;
+  const phone = phoneIn || challenge.phone;
+  const verifiedEmail = emailIn ?? challenge.email;
 
   let user = await prisma.user.findUnique({ where: { phone } });
+  if (!user && verifiedEmail) {
+    user = await prisma.user.findUnique({ where: { email: verifiedEmail } });
+  }
   if (!user) {
     const emailTaken = await prisma.user.findUnique({ where: { email: verifiedEmail } });
     if (emailTaken) {
@@ -212,7 +236,10 @@ authRouter.post("/login", async (req, res) => {
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "phone and passcode required");
   const phone = normalizePhone(body.data.phone);
-  const user = await prisma.user.findUnique({ where: { phone } });
+  const user = await prisma.user.findUnique({
+    where: { phone },
+    include: { merchant: { select: { id: true } } },
+  });
   if (!user) return fail(res, 401, "INVALID_CREDENTIALS", "Wrong phone or passcode");
   if (!user.passcodeHash) {
     return fail(
@@ -225,7 +252,13 @@ authRouter.post("/login", async (req, res) => {
   const match = await bcrypt.compare(body.data.passcode, user.passcodeHash);
   if (!match) return fail(res, 401, "INVALID_CREDENTIALS", "Wrong phone or passcode");
 
-  const authUser = { id: user.id, role: user.role, platformRole: user.platformRole };
+  let role = user.role;
+  if (user.merchant && role !== "MERCHANT") {
+    await prisma.user.update({ where: { id: user.id }, data: { role: "MERCHANT" } });
+    role = "MERCHANT";
+  }
+
+  const authUser = { id: user.id, role, platformRole: user.platformRole };
   const accessToken = signAccess(authUser);
   const refreshToken = signRefresh(authUser);
   const refreshTokenHash = createHash("sha256").update(refreshToken).digest("hex");
@@ -244,10 +277,10 @@ authRouter.post("/login", async (req, res) => {
       phone: user.phone,
       name: user.name,
       email: user.email,
-      role: user.role,
+      role,
       platformRole: user.platformRole,
       avatarUrl: user.avatarUrl,
-      onboardingDone: user.onboardingDone,
+      onboardingDone: user.onboardingDone || Boolean(user.merchant),
     }),
   });
 });

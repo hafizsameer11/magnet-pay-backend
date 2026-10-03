@@ -2,7 +2,7 @@ import { randomInt } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { creditWallet } from "./ledger.js";
 import { quotePlatformAndAgent } from "./merchant-fees.js";
-import { stubNameCheck } from "./merchant-name-check.js";
+import { stubNameCheck, resolveWalletNameCheck } from "./merchant-name-check.js";
 import {
   applyCashIn,
   applyCashOut,
@@ -127,18 +127,27 @@ export async function cashIn(opts: {
       : null;
 
   if (!targetUser && opts.walletTag) {
-    const tag = opts.walletTag.startsWith("@") ? opts.walletTag : `@${opts.walletTag}`;
-    const m = await prisma.merchant.findUnique({ where: { tag } });
-    if (m) {
-      targetUser = await prisma.user.findUnique({ where: { id: m.userId } });
+    const lookup = await resolveWalletNameCheck(opts.walletTag);
+    if (lookup.ok) {
+      // Re-resolve to get user id via phone candidates / tag
+      const tag = opts.walletTag.replace(/^@/, "");
+      if (/^u\d{10}$/i.test(tag)) {
+        const last10 = tag.slice(1);
+        targetUser = await prisma.user.findFirst({ where: { phone: { endsWith: last10 } } });
+      } else {
+        const dig = opts.walletTag.replace(/\D/g, "");
+        if (dig.length >= 10) {
+          targetUser = await prisma.user.findFirst({ where: { phone: { endsWith: dig.slice(-10) } } });
+        }
+      }
     }
   }
 
-  const nameCheck = stubNameCheck(
-    phone || opts.walletTag ? "wallet" : "account",
-    phone ?? opts.walletTag ?? opts.bankAccount ?? "",
-  );
-  if (!nameCheck.ok) throw new Error(nameCheck.message);
+  const check =
+    phone || opts.walletTag
+      ? await resolveWalletNameCheck(phone ?? opts.walletTag ?? "")
+      : stubNameCheck("account", opts.bankAccount ?? "");
+  if (!check.ok) throw new Error(check.message);
 
   const ref = nextRef("DP-");
 
@@ -176,12 +185,12 @@ export async function cashIn(opts: {
         agentFeeMinor: fees.agentFeeMinor,
         customerTotalMinor: fees.customerTotalMinor,
         counterparty: phone ?? opts.walletTag ?? opts.bankAccount ?? null,
-        counterpartyName: opts.counterpartyName ?? nameCheck.name,
+        counterpartyName: opts.counterpartyName ?? check.name,
         status: "COMPLETED",
         meta: {
           bankName: opts.bankName ?? null,
           creditedUserId: targetUser?.id ?? null,
-          nameCheck: nameCheck.name,
+          nameCheck: check.name,
         },
       },
     });
@@ -203,8 +212,8 @@ export async function transfer(opts: {
     throw new Error("Insufficient digital float");
   }
 
-  const nameCheck = stubNameCheck("wallet", opts.destination);
-  if (!nameCheck.ok) throw new Error(nameCheck.message);
+  const check = await resolveWalletNameCheck(opts.destination);
+  if (!check.ok) throw new Error(check.message);
 
   const ref = nextRef("TR-");
 
@@ -224,7 +233,7 @@ export async function transfer(opts: {
         agentFeeMinor: fees.agentFeeMinor,
         customerTotalMinor: fees.customerTotalMinor,
         counterparty: opts.destination,
-        counterpartyName: opts.counterpartyName ?? nameCheck.name,
+        counterpartyName: opts.counterpartyName ?? check.name,
         status: "COMPLETED",
       },
     });

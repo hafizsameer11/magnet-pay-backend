@@ -30,7 +30,7 @@ import {
 } from "../services/merchant-serve.js";
 import { listBillers, verifyBill, payBill } from "../services/merchant-bills.js";
 import { listAgents } from "../services/merchant-directory.js";
-import { stubNameCheck } from "../services/merchant-name-check.js";
+import { nameCheck } from "../services/merchant-name-check.js";
 import { ensureSystemAccounts, ensureUserLedgerAccounts } from "../services/ledger.js";
 
 export const merchantRouter = Router();
@@ -731,7 +731,7 @@ merchantRouter.post("/bills/pay", requireMerchant, async (req, res) => {
   }
 });
 
-/** Stub enquiry — public so merchant onboard can verify BVN/account before a session exists. */
+/** Wallet/phone resolve against users; other kinds stubbed until NIBSS/billers are live. */
 merchantRouter.post("/name-check", async (req, res) => {
   const body = z
     .object({
@@ -740,7 +740,7 @@ merchantRouter.post("/name-check", async (req, res) => {
     })
     .safeParse(req.body);
   if (!body.success) return fail(res, 400, "VALIDATION", "kind and value required");
-  return ok(res, stubNameCheck(body.data.kind, body.data.value));
+  return ok(res, await nameCheck(body.data.kind, body.data.value));
 });
 
 merchantRouter.get("/fees", requireMerchant, async (_req, res) => {
